@@ -1,0 +1,16 @@
+spring:
+  application:
+    name: file-service
+
+server:
+  port: 8084
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true

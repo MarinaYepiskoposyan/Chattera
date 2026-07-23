@@ -1,0 +1,107 @@
+{
+  "realm": "chattera",
+  "displayName": "Chattera",
+  "enabled": true,
+
+  "registrationAllowed": true,
+  "registrationEmailAsUsername": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": true,
+  "verifyEmail": false,
+  "editUsernameAllowed": false,
+
+  "accessTokenLifespan": 300,
+
+  "clients": [
+    {
+      "clientId": "chattera-web",
+      "name": "Chattera Web",
+      "description": "Public SPA client for the Chattera web frontend. Authorization Code + PKCE (S256), no client secret.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "authorizationServicesEnabled": false,
+      "frontchannelLogout": true,
+      "redirectUris": [
+        "http://localhost:3000/*"
+      ],
+      "webOrigins": [
+        "http://localhost:3000"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:3000/*"
+      },
+      "fullScopeAllowed": true
+    },
+    {
+      "clientId": "chattera-mobile",
+      "name": "Chattera Mobile",
+      "description": "Public native client for the Chattera mobile app. Authorization Code + PKCE (S256), custom-scheme redirect, no client secret.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "authorizationServicesEnabled": false,
+      "frontchannelLogout": true,
+      "redirectUris": [
+        "chattera://callback"
+      ],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "chattera://callback"
+      },
+      "fullScopeAllowed": true
+    },
+    {
+      "clientId": "chattera-test-client",
+      "name": "Chattera Test Client -- DEV/TEST ONLY, DO NOT PROMOTE",
+      "description": "*** DEV/TEST ONLY *** Confidential client, ROPC (directAccessGrantsEnabled=true) for headless smoke tests -- no frontend exists yet for PKCE. NEVER enable this pattern in staging/production. See infra/README.md.",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "standardFlowEnabled": false,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": true,
+      "serviceAccountsEnabled": false,
+      "authorizationServicesEnabled": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "29783f3965931971396b129def2e82eac45bc259527aaf89",
+      "redirectUris": [],
+      "webOrigins": [],
+      "fullScopeAllowed": true
+    }
+  ],
+
+  "users": [
+    {
+      "username": "testuser",
+      "email": "testuser@chattera.dev",
+      "emailVerified": true,
+      "enabled": true,
+      "firstName": "Test",
+      "lastName": "User",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "186ba229b456666f3a76d3de",
+          "temporary": false
+        }
+      ],
+      "attributes": {
+        "_comment": [
+          "DEV/TEST ONLY user for headless smoke testing via chattera-test-client's Resource Owner Password Credentials grant. See infra/README.md. Do not use this account for anything beyond local automated testing."
+        ]
+      }
+    }
+  ]
+}

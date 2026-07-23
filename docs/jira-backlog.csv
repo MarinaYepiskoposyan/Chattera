@@ -1,0 +1,14 @@
+Key,Summary,Type,Priority,Story Points,Assignee,Status,Sprint,Description
+CHAT-100,Create MVP chat platform foundation,Epic,High,13,Solution Architect,To Do,Sprint 1,Establish the core architecture and delivery scope for the MVP.
+CHAT-101,Document business requirements and acceptance criteria,Story,High,3,BA,To Do,Sprint 1,Write user stories for chat rooms, direct messages, and file sharing.
+CHAT-102,Design architecture and API contracts,Story,High,5,Solution Architect,To Do,Sprint 1,Define service boundaries, data flow, and integration points.
+CHAT-103,Implement authentication and user profiles,Story,High,5,Developer,To Do,Sprint 1,Support registration, login, and profile access for users.
+CHAT-104,Implement chat room creation and messaging,Story,High,8,Developer,To Do,Sprint 1,Allow users to create rooms, join rooms, and send messages.
+CHAT-105,Implement one-to-one direct messaging,Story,High,5,Developer,To Do,Sprint 1,Allow users to start private conversations and exchange messages.
+CHAT-106,Implement file upload and download flow,Story,High,8,Developer,To Do,Sprint 1,Allow users to share files and retrieve them from chat history.
+CHAT-107,Implement real-time message delivery,Story,High,8,Developer,To Do,Sprint 1,Deliver messages instantly via the real-time messaging layer.
+CHAT-108,Create deployment pipeline and environments,Story,High,5,DevOps,To Do,Sprint 1,Set up CI/CD, staging environments, and base deployment automation.
+CHAT-109,Define QA strategy and smoke tests,Story,Medium,3,QA,To Do,Sprint 1,Prepare test cases for messaging, rooms, DMs, and file sharing.
+CHAT-110,Create performance test plan and metrics,Story,Medium,3,Performance Team,To Do,Sprint 1,Define target latencies, load scenarios, and monitoring metrics.
+CHAT-111,Sprint 1 planning and coordination,Task,Medium,2,Scrum Master,To Do,Sprint 1,Organize sprint planning, standups, and backlog refinement.
+CHAT-112,Track sprint status and stakeholder reporting,Task,Medium,2,Project Manager,To Do,Sprint 1,Create milestone updates and manage delivery communication.

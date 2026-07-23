@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p .claude/agents)",
+      "PowerShell(claude --help)",
+      "Read(//c/Users/marinay/AppData/Roaming/**)",
+      "PowerShell(npm list -g --depth=0)",
+      "PowerShell(node --version)",
+      "PowerShell(npm --version)",
+      "PowerShell(npm config get prefix)",
+      "Read(//c/Users/marinay/.local/bin/**)",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(Get-Content *)",
+      "PowerShell(Get-Service *)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\marinay\\Projects\\MyProjects\\Chattera\\Chattera\\.claude"
+    ]
+  }
+}

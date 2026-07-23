@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.chattera</groupId>
+    <artifactId>chattera-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <relativePath>../../pom.xml</relativePath>
+  </parent>
+
+  <artifactId>common-security</artifactId>
+  <packaging>jar</packaging>
+
+  <name>Chattera :: Platform :: Common Security</name>
+  <description>
+    Shared OAuth2 resource-server building blocks for every Chattera service
+    that validates Keycloak-issued JWTs: a JwtAuthenticationConverter that
+    maps the token's realm_access.roles claim to Spring authorities, exposed
+    as a Spring Boot auto-configuration so consuming services get it for free
+    by adding this dependency plus spring-boot-starter-oauth2-resource-server.
+    Each service still owns its own SecurityFilterChain (permitted paths
+    differ per service); only the role-mapping converter is shared here.
+  </description>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+    </dependency>
+  </dependencies>
+</project>

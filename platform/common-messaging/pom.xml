@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.chattera</groupId>
+    <artifactId>chattera-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+    <relativePath>../../pom.xml</relativePath>
+  </parent>
+
+  <artifactId>common-messaging</artifactId>
+  <packaging>jar</packaging>
+
+  <name>Chattera :: Platform :: Common Messaging</name>
+  <description>
+    Event-bus abstraction stub. The messaging backbone technology (RabbitMQ,
+    Kafka, or Redis Streams) is not yet finalized (see solution-architecture.md),
+    so this module only defines the publisher-side contract that chat-service
+    and file-service will implement against once the backbone is chosen.
+    Deliberately has no runtime dependency on any specific broker client yet.
+  </description>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.chattera</groupId>
+      <artifactId>common-domain</artifactId>
+    </dependency>
+  </dependencies>
+</project>

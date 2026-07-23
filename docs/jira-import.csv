@@ -1,0 +1,14 @@
+Summary,Issue Type,Priority,Labels,Assignee,Description,Story Points
+Chattera MVP Foundation,Epic,High,Chattera;MVP,Solution Architect,"Create the MVP foundation for a scalable chat application supporting rooms, direct messages, and file sharing.",13
+Define business requirements and acceptance criteria,Story,High,Chattera;BA,BA,"Document the core user stories, business rules, and acceptance criteria for authentication, rooms, direct messages, and file sharing.",3
+Design architecture and API contracts,Story,High,Chattera;Architecture,Solution Architect,"Define the high-level architecture, service boundaries, APIs, and integration patterns for the MVP.",5
+Implement user authentication and profiles,Story,High,Chattera;Backend,Developer,"Add registration, login, session handling, and basic user profile support.",5
+Implement chat room creation and messaging,Story,High,Chattera;Messaging,Developer,"Allow users to create and join chat rooms and exchange messages in real time.",8
+Implement one-to-one direct messaging,Story,High,Chattera;Messaging,Developer,"Allow users to start private conversations and exchange messages between two users.",5
+Implement file upload and download flow,Story,High,Chattera;Files,Developer,"Enable users to upload files, share them through chat, and download them later.",8
+Implement real-time message delivery,Story,High,Chattera;Realtime,Developer,"Deliver new messages instantly to active users and maintain chat state.",8
+Set up CI/CD and deployment environments,Story,High,Chattera;DevOps,DevOps,"Create a staging deployment pipeline and baseline environment automation for the MVP.",5
+Create QA smoke test plan,Story,Medium,Chattera;QA,QA,"Define smoke tests and regression coverage for authentication, rooms, direct messages, and file sharing.",3
+Create performance test plan and metrics,Story,Medium,Chattera;Performance,Performance Team,"Define latency targets, load scenarios, and monitoring metrics for the MVP.",3
+Sprint 1 planning and coordination,Task,Medium,Chattera;Agile,Scrum Master,"Plan Sprint 1, run sprint ceremonies, and coordinate delivery of the MVP scope.",2
+Track sprint status and stakeholder reporting,Task,Medium,Chattera;PM,Project Manager,"Track progress, report status, and manage stakeholder communication for Sprint 1.",2

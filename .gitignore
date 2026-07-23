@@ -1,0 +1,33 @@
+# Environment files (local secrets/config; see .env.example for the template)
+.env
+.env.*
+!.env.example
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.idea/
+.vscode/
+*.iml
+
+# NOTE: docker-compose.yml uses named volumes (postgres_data, keycloak_data,
+# minio_data) for all container state, so no bind-mounted data directories
+# land inside the repo tree — nothing to ignore there.
+
+# Java / Maven (introduced by the Maven multi-module monorepo under
+# platform/ and services/ - see CLAUDE.md "Working in This Repo")
+target/
+*.class
+*.jar
+*.war
+!.mvn/wrapper/maven-wrapper.jar
+.mvn/timing.properties
+
+# IDE (Java-specific; .idea/ and *.iml already covered above for IntelliJ)
+.classpath
+.project
+.settings/
+bin/
+out/
