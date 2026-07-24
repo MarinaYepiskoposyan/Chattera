@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Status
 
-Chattera has moved past pre-implementation: a Java 21 / Spring Boot 3.5.x Maven multi-module monorepo exists under `platform/` (shared libraries) and `services/` (deployable services), alongside the local infra stack under `infra/` and `docker-compose.yml`. `profile-service` (CHAT-103) is fully implemented; `gateway`, `ws-gateway`, `chat-service`, and `file-service` are scaffolds only (an empty Spring Boot app exposing `/actuator/health`, no business logic yet — implemented in later tickets). Check the current state of a given module before assuming behavior beyond what's described below; `docs/` remains the source of truth for scope not yet built.
+Chattera has moved past pre-implementation: a Java 21 / Spring Boot 3.5.x Maven multi-module monorepo exists under `platform/` (shared libraries) and `services/` (deployable services), alongside the local infra stack under `infra/` and `docker-compose.yml`. `profile-service` (CHAT-103) and `chat-service` (CHAT-104: room create/join/leave, message post + keyset-paginated history, best-effort publish to RabbitMQ after commit — no WebSocket/consumer side yet, that's CHAT-107) are fully implemented; `gateway`, `ws-gateway`, and `file-service` are scaffolds only (an empty Spring Boot app exposing `/actuator/health`, no business logic yet — implemented in later tickets). Check the current state of a given module before assuming behavior beyond what's described below; `docs/` remains the source of truth for scope not yet built.
 
 ## What Chattera Is
 
@@ -44,8 +44,10 @@ delegated to Keycloak (external OIDC provider); every Chattera service is a pure
 resource server (spring-boot-starter-oauth2-resource-server, `issuer-uri` -> Keycloak
 realm). Clients log in via Authorization Code + PKCE. There is no Chattera-issued JWT and
 no Redis-backed refresh token — those are superseded by Keycloak. PostgreSQL + Flyway,
-Redis (cache/presence), MinIO with presigned URLs. Build tool, data-access library, and
-event bus are proposed but pending Sprint 1 refinement — see
+Redis (cache/presence), MinIO with presigned URLs. Build tool (Maven multi-module) and
+event bus (**RabbitMQ via Spring AMQP**, decided CHAT-104 — chat-service is the first
+producer) are settled; the data-access library (JPA baseline, hot-path revisit) is still
+open pending Sprint 1 refinement — see
 [docs/solution-architecture.md](docs/solution-architecture.md).
 
 Design principles carried forward from the architecture doc:
@@ -93,7 +95,9 @@ The standard flow for a feature is `solution-architect` → `business-analyst` �
 - Keep new code aligned with the service boundaries in the architecture doc (auth, chat, presence, file, gateway) rather than building a monolith, unless the user directs otherwise.
 - Treat `docs/` as the source of truth for scope and design intent not yet superseded by actual implementation.
 - Shared code goes in `platform/` (`common-domain`, `common-security`, `common-messaging`, `common-observability`) and is consumed by `services/*` as regular Maven dependencies, not copy-pasted.
-- `common-security` auto-configures JWT handling for any service that depends on it and sets `issuer-uri`: the `realm_access.roles` → authority converter **and** (CHAT-28) a `JwtDecoder` that validates the token's `azp` (authorized party) against an allowlist of sanctioned Keycloak clients (`chattera.security.jwt.accepted-client-ids`). Services inherit both automatically — do not re-add `aud`/`azp` checks per service. See [docs/guides/how-security-works.md](docs/guides/how-security-works.md) §6.2. Note: a service's own `JwtDecoder` bean overrides the shared one, and web-slice tests still supply their own decoder as they do today.
+- `common-security` auto-configures JWT handling for any service that depends on it and sets `issuer-uri`: the `realm_access.roles` → authority converter **and** (CHAT-28) a `JwtDecoder` that validates the token's `azp` (authorized party) against an allowlist of sanctioned Keycloak clients (`chattera.security.jwt.accepted-client-ids`). Services inherit both automatically — do not re-add `aud`/`azp` checks per service. See [docs/guides/how-security-works.md](docs/guides/how-security-works.md) §6.2. Note: a service's own `JwtDecoder` bean overrides the shared one, and web-slice tests still supply their own decoder as they do today. chat-service (CHAT-104) reused this with zero extra config beyond its own `SecurityFilterChain` — confirms the pattern generalizes past profile-service.
+- `common-messaging` (CHAT-104) auto-configures a RabbitMQ-backed `EventPublisher<DomainEvent>` for any service that has `spring-boot-starter-amqp` on the classpath (pulled in transitively by depending on `common-messaging`) and standard `spring.rabbitmq.*` connection properties set — same auto-configuration-by-dependency pattern as `common-security`. Publishing is to one shared topic exchange (`chattera.events` by default, `chattera.messaging.exchange` to override) with the caller's routing key; `EventPublisher.publish` never throws (transport failures are logged and swallowed) since the bus is transient delivery and Postgres is the source of truth — see solution-architecture.md's CHAT-104 section for the persist-then-publish rationale. Shared domain event payloads (e.g. `RoomMessageCreatedEvent`) live in `common-domain`'s `event` package so future consumers (ws-gateway, CHAT-107) can depend on the same on-the-wire type without depending on the producing service.
+- Services sharing the one dev Postgres database (`chattera`) each get their **own Postgres schema**, not the default `public` schema — `profile-service` implicitly uses `public` (unchanged, first mover), `chat-service` explicitly targets `chat_service` via `spring.flyway.schemas` + `spring.jpa.properties.hibernate.default_schema` in its `application.yml`. Without this, two services' Flyway histories collide on version numbers (both start at `V1__...`) in the same `flyway_schema_history` table, since Flyway's history table isn't itself namespaced per service. Any new service adding its own schema/migrations should follow chat-service's pattern (pick a distinct schema name) rather than profile-service's implicit-`public` one. `@DataJpaTest`-based tests should use `@TestPropertySource` (or a shared composed annotation — see chat-service's `ChatDataJpaTest`) to reset both properties back to unset, since the embedded H2 substitute per test doesn't need or have a `chat_service` schema.
 
 ### Build/test (Maven multi-module monorepo)
 
@@ -129,21 +133,21 @@ cd services/profile-service
 mvn spring-boot:run
 ```
 
-or `java -jar services/profile-service/target/profile-service-0.1.0-SNAPSHOT.jar` after a full build.
+or `java -jar services/profile-service/target/profile-service-0.1.0-SNAPSHOT.jar` after a full build. Same pattern for chat-service (`cd services/chat-service && mvn spring-boot:run`).
 
-profile-service also needs the local infra stack up (Postgres + Redis + Keycloak — see below) and reads connection info from environment variables with dev-friendly defaults baked into `application.yml` (`SPRING_DATASOURCE_URL`/`_USERNAME`/`_PASSWORD`, `SPRING_DATA_REDIS_HOST`/`_PORT`, `KEYCLOAK_ISSUER_URI`). Defaults already match `docker-compose.yml`/`.env.example`, so `docker compose up -d` followed by the two commands above works with no extra env vars. Ports: gateway 8090, ws-gateway 8081, profile-service 8082, chat-service 8083, file-service 8084 (8080 is reserved for Keycloak locally).
+profile-service also needs the local infra stack up (Postgres + Redis + Keycloak — see below) and reads connection info from environment variables with dev-friendly defaults baked into `application.yml` (`SPRING_DATASOURCE_URL`/`_USERNAME`/`_PASSWORD`, `SPRING_DATA_REDIS_HOST`/`_PORT`, `KEYCLOAK_ISSUER_URI`). chat-service needs Postgres + Keycloak (same env vars) plus RabbitMQ (`SPRING_RABBITMQ_HOST`/`_PORT`/`_USERNAME`/`_PASSWORD`) — a broker outage doesn't block REST traffic (see the `common-messaging` note above), it just means published events go nowhere. Defaults already match `docker-compose.yml`/`.env.example`, so `docker compose up -d` followed by the two commands above works with no extra env vars. Ports: gateway 8090, ws-gateway 8081, profile-service 8082, chat-service 8083, file-service 8084 (8080 is reserved for Keycloak locally; RabbitMQ is 5672 (AMQP) / 15672 (management UI), not a per-service HTTP port).
 
 No lint tool is configured yet (flag if one is wanted — e.g. Checkstyle/Spotless — rather than assuming).
 
-### Local infrastructure (Postgres, Redis, MinIO, Keycloak)
+### Local infrastructure (Postgres, Redis, MinIO, RabbitMQ, Keycloak)
 
-Needed alongside the Maven build above for anything that touches Postgres/Redis/Keycloak (e.g. running profile-service, or its `@DataJpaTest`-only test suite does *not* need this — it uses an embedded H2 substitute). From the repo root:
+Needed alongside the Maven build above for anything that touches Postgres/Redis/RabbitMQ/Keycloak (e.g. running profile-service or chat-service; their `@DataJpaTest`-only test suites do *not* need this — they use an embedded H2 substitute). From the repo root:
 
 ```
 cp .env.example .env   # first time only; edit values if desired
 docker compose up -d
 ```
 
-Brings up Postgres (app `chattera` db + a separate least-privilege `keycloak` db/role — never a shared schema), Redis, MinIO, and a self-hosted Keycloak (`quay.io/keycloak/keycloak:26.0`, `start-dev --import-realm`) auto-loaded with the `chattera` realm from [`infra/keycloak/realm-export/chattera-realm.json`](infra/keycloak/realm-export/chattera-realm.json) (clients `chattera-web` and `chattera-mobile`, both public, Authorization Code + PKCE S256, no client secret). Full usage, ports, and verification steps: [`infra/README.md`](infra/README.md). Point a service's resource-server config at `issuer-uri: http://localhost:8080/realms/chattera` for local token validation.
+Brings up Postgres (app `chattera` db + a separate least-privilege `keycloak` db/role — never a shared schema; see the `common-messaging`/schema-per-service note above for how services then isolate themselves *within* that one `chattera` app database), Redis, MinIO, RabbitMQ (`rabbitmq:3.13-management-alpine`, CHAT-104's event bus — chat-service is the first producer), and a self-hosted Keycloak (`quay.io/keycloak/keycloak:26.0`, `start-dev --import-realm`) auto-loaded with the `chattera` realm from [`infra/keycloak/realm-export/chattera-realm.json`](infra/keycloak/realm-export/chattera-realm.json) (clients `chattera-web` and `chattera-mobile`, both public, Authorization Code + PKCE S256, no client secret). Full usage, ports, and verification steps: [`infra/README.md`](infra/README.md). Point a service's resource-server config at `issuer-uri: http://localhost:8080/realms/chattera` for local token validation.
 
 For headless smoke testing against a running service (e.g. `profile-service`) without a browser-driven PKCE flow, the realm also has a **dev/test-only** confidential client, `chattera-test-client` (Resource Owner Password Credentials / `directAccessGrantsEnabled: true`), and a `testuser` account. This exists only for local automated testing — never enable `directAccessGrantsEnabled` on a client in staging/production. Credentials and the token curl command are in [`infra/README.md`](infra/README.md#dev-test-only-getting-a-token-without-a-browser) (values also live in `.env`, gitignored).

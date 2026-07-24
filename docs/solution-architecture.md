@@ -48,18 +48,20 @@ Decided this session (do not re-litigate; these are the working baseline):
 - Cache/presence: Redis (hot-conversation cache, presence keys). Refresh tokens and SSO
   sessions are no longer Chattera's concern — Keycloak holds them in its own store.
 - Real-time: WebSocket traffic is kept in ws-gateway, separate from REST in gateway.
+- Build tooling: Maven multi-module monorepo (`platform/*` shared libraries consumed by
+  `services/*`). Decided — the repo is built on it and profile-service ships on it. (The
+  earlier "Gradle proposed" note is superseded.)
+- Event bus: **RabbitMQ via Spring AMQP** (decided CHAT-104 — see "Chat Rooms & Messaging"
+  below). chat-service is the first producer onto the backbone; the `EventPublisher`
+  abstraction in `platform/common-messaging` gets its first concrete transport here.
+  Rationale and the options weighed are documented in the CHAT-104 section. WebSocket
+  delivery (ws-gateway) uses Spring WebSocket + STOMP with RabbitMQ's STOMP broker relay so
+  cross-instance fanout is handled by the broker rather than in app code (wired in CHAT-107).
 
 Proposed, pending Sprint 1 refinement with developer/qa-engineer:
-- Build tooling: Gradle (Kotlin DSL) multi-module monorepo — lean, pending team
-  familiarity confirmation (Maven multi-module is an acceptable fallback).
 - Data access: Spring Data JPA/Hibernate for CRUD velocity in Sprint 1; the message
   read/history hot path may later move to jOOQ or JdbcClient (revisit with
   performance-engineer). Final call left to developer.
-- Event bus: RabbitMQ (lean) for delivery fanout/routing via Spring AMQP; Kafka is the
-  alternative if the team wants to commit to the streaming backbone now (that leans into
-  the deferred 1M-scale work). Redis Streams/Pub-Sub is the minimal-footprint fallback.
-- WebSocket protocol: Spring WebSocket + STOMP in ws-gateway; if RabbitMQ is chosen, use
-  its STOMP broker relay so cross-instance fanout is handled by the broker.
 
 ## Recommended Initial Architecture
 1. Use stateless application services behind a load balancer.
@@ -185,6 +187,159 @@ expires it on disconnect; the profile service reads that key to report online/of
 The `userId` is the Keycloak `sub` from the validated token — the only coupling to
 Keycloak is that the identifier now comes from the token subject.
 
+## Chat Rooms & Messaging (CHAT-104 / FR-02)
+Design baseline for chat-service. Traces to FR-02 (create/join/leave rooms, multiple
+participants, message history) with deliberate boundaries to FR-03 (DMs, CHAT-105) and
+FR-05 (real-time + delivered/read status, CHAT-107). Follows the profile-service
+precedent: an independent OAuth2 resource server, Flyway-owned schema, JPA for CRUD.
+
+### Event bus decision — RabbitMQ (Spring AMQP)
+Decided here because CHAT-104 is the first producer and the choice blocks implementation.
+Options weighed:
+- **RabbitMQ (chosen).** Chat delivery is a routing/fanout problem — one room message fans
+  out to N member sockets, one DM routes to a single recipient's sockets — which is exactly
+  the topic-exchange model. Spring AMQP is first-class and matches the low-ceremony DX of
+  the existing services. Its STOMP broker relay lets multiple ws-gateway instances all
+  receive a published message with no app-level coordination, which is what keeps ws-gateway
+  stateless behind the load balancer (CHAT-107). Modest operational footprint (one broker
+  container added to `docker-compose.yml`, owned with devops-engineer).
+- **Kafka (rejected for Sprint 1).** Its strengths — partitioned durable log, replay,
+  high-throughput streaming — are the 1M-scale concerns that are explicitly deferred.
+  Adopting it now is premature commitment and a heavier ops burden for MVP.
+- **Redis Streams/Pub-Sub (rejected).** Pub/Sub is fire-and-forget (a message published
+  while ws-gateway is momentarily down is lost); Streams would work but is lower-level with
+  weaker Spring ergonomics, and it concentrates cache + presence + durable bus onto one
+  Redis instance. Not worth it when RabbitMQ fits the fanout model directly.
+
+**The bus is transient delivery, not the message store.** PostgreSQL remains the single
+source of truth for message history. A message is persisted (committed) *before* it is
+published; a dropped/undelivered event never loses data because clients re-fetch recent
+history on (re)connect. This keeps RabbitMQ durability requirements modest for Sprint 1.
+Publish is best-effort: a publish failure is logged and must **not** fail the REST write.
+A transactional outbox (publish exactly-once, tied to the DB commit) is noted as later
+hardening — deferred, not Sprint 1.
+
+### Scope split: CHAT-104 vs CHAT-107 (confirmed)
+- **CHAT-104 owns** the REST + persistence + producer side, and is independently
+  buildable/testable without CHAT-107:
+  - REST: create room, join room, leave room, list a room's members, post a message,
+    fetch message history.
+  - Persistence: rooms, room membership, messages (schema below).
+  - Producing: after the message row commits, publish a `RoomMessageCreated` event to the
+    RabbitMQ topic exchange (routing key by room). If no consumer/queue is bound yet
+    (CHAT-107 not built), the event is simply not delivered — acceptable, because history
+    is durable in Postgres.
+- **CHAT-107 owns** the consumer/real-time side: ws-gateway subscribing to the bus and
+  pushing to live sockets, plus the delivered/read receipt round-trip.
+
+CHAT-104 acceptance is verified entirely over REST (POST message returns the persisted
+message; GET history returns it in order). No WebSocket dependency to close the ticket.
+
+### Message status (FR-05 boundary)
+The `messages` table carries a `status` column now so no migration is needed later, but
+CHAT-104 only ever writes `SENT` (server-accepted + persisted). `DELIVERED`/`READ`
+transitions are inherently real-time and belong to CHAT-107. For a single recipient (DMs,
+CHAT-105) a single per-message status is sufficient. **Per-recipient read receipts in
+multi-participant rooms ("read by whom?") are a genuinely larger, fan-out N:M concern** —
+that needs a separate `message_receipts(message_id, user_id, status)` table and is flagged
+to CHAT-107, likely limited to DMs for Sprint 1. Do not build room-level per-recipient
+receipts in CHAT-104.
+
+### Data model (chat-service schema, Flyway)
+**A direct message is a specialization of a room, not a separate concept.** DMs (CHAT-105)
+are modelled as a room with `type = 'DIRECT'` and exactly two members, so they reuse
+`room_members`, `messages`, and the history/pagination path rather than a parallel schema.
+The `rooms.type` CHECK already includes `DIRECT`, so CHAT-105 adds no change to these tables
+— it is a thin layer on top of CHAT-104, differing only in these DM-specific rules:
+- **No name** — `rooms.name` is null for DIRECT (hence nullable); the UI shows the other
+  participant's display name.
+- **Exactly two members, set at creation** — not self-joinable (PRIVATE/DIRECT are not
+  self-joinable per the authorization rules below). Roles are symmetric — both `MEMBER`;
+  ownership is meaningless for a DM.
+- **One DM per user pair (uniqueness)** — CHAT-105 adds a `direct_key` column populated
+  only for DIRECT rooms = the two `sub`s in canonical (sorted) order
+  (`min(a,b) + ':' + max(a,b)`), with a `UNIQUE` index; null/unused for PUBLIC/PRIVATE.
+  This enforces pair-uniqueness at the DB level.
+- **Find-or-create, idempotent** — the DM endpoint computes `direct_key`; if a DIRECT room
+  for the pair exists it is returned, else created. Messaging/history then route through the
+  same `/rooms/{roomId}/messages` endpoints — no duplicate DM rooms.
+- **Self-DM blocked** — reject when the target user equals the caller `sub` (AC-4).
+
+```
+rooms
+  id           UUID PRIMARY KEY
+  name         VARCHAR(255)        -- nullable for DIRECT rooms
+  type         VARCHAR(16) NOT NULL CHECK (type IN ('PUBLIC','PRIVATE','DIRECT'))
+  created_by   VARCHAR(255) NOT NULL          -- Keycloak sub
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+
+room_members
+  room_id      UUID NOT NULL REFERENCES rooms(id) ON DELETE CASCADE
+  user_id      VARCHAR(255) NOT NULL           -- Keycloak sub
+  role         VARCHAR(16) NOT NULL DEFAULT 'MEMBER' CHECK (role IN ('OWNER','MEMBER'))
+  joined_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+  PRIMARY KEY (room_id, user_id)
+
+messages
+  id           UUID PRIMARY KEY
+  room_id      UUID NOT NULL REFERENCES rooms(id) ON DELETE CASCADE
+  sender_id    VARCHAR(255) NOT NULL           -- Keycloak sub
+  content      TEXT NOT NULL
+  status       VARCHAR(16) NOT NULL DEFAULT 'SENT'
+                 CHECK (status IN ('SENT','DELIVERED','READ'))
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+
+  INDEX (room_id, created_at DESC, id DESC)   -- serves history fetch + keyset pagination
+```
+
+`created_at` is `TIMESTAMPTZ` (following the V2 profiles correction). `id` is a UUID
+assigned by the app/DB. The composite index is the workhorse for the history query below.
+
+### Authorization boundary
+chat-service is its own OAuth2 resource server, wired exactly like profile-service
+(`common-security` auto-configures JWT validation, the realm-role→authority converter, and
+the `azp` allowlist; the service only defines its `SecurityFilterChain` permitting
+`/actuator/health` and authenticating everything else). `userId` is always the validated
+JWT `sub` via `@AuthenticationPrincipal Jwt` — never a client-supplied body/param.
+
+Room-scoped rules, enforced inside chat-service (services are not trusted to be reachable
+only via a gateway):
+- **Post / read history / list members / leave**: caller must be a member of the room.
+  Non-members get 403.
+- **Join**: `PUBLIC` rooms are self-joinable by any authenticated user. `PRIVATE` and
+  `DIRECT` rooms are not self-joinable — membership is established by the creator/owner
+  (an owner-adds-member action) or, for DMs, by the find-or-create-DM flow in CHAT-105. A
+  richer invite workflow for PRIVATE rooms is a post-Sprint-1 follow-up, noted.
+- **Create**: any authenticated user; the creator is inserted as the `OWNER` member in the
+  same transaction as the room row.
+
+### Client entry point
+Clients call chat-service **directly** on its port (8083), the same as the profile-service
+precedent. `gateway` is still a routing-less scaffold with no ticket to add routing, so
+gateway routing is **not** in CHAT-104 scope. Design the REST paths to be gateway-friendly
+so a future gateway can front them without rework — e.g. `POST /rooms`,
+`POST /rooms/{roomId}/members` (join), `DELETE /rooms/{roomId}/members/me` (leave),
+`GET /rooms/{roomId}/members`, `POST /rooms/{roomId}/messages`,
+`GET /rooms/{roomId}/messages` (history). A future gateway can route `/api/chat/**` to these
+unchanged.
+
+### Message history pagination (applies to BOTH rooms CHAT-104 and DMs CHAT-105)
+Decided once, consistently. History is returned **bounded, newest-first, with an optional
+keyset (cursor) parameter for loading older messages** — not offset pagination, and not an
+unbounded "return everything" fetch.
+- `GET /rooms/{roomId}/messages?limit=50&before=<cursor>`
+- `limit` default 50, hard max 50 (a bound is mandatory regardless — an unbounded response
+  on a busy room is a correctness/performance defect, not a missing feature).
+- `before` is an opaque keyset cursor over `(created_at, id)`; omit it for the first
+  (most-recent) page. The server returns the next cursor when more history exists.
+- Keyset (not offset) because it rides the `(room_id, created_at DESC, id DESC)` index and
+  stays correct/cheap as history grows — offset degrades and is the thing to avoid.
+- Rationale for including a cursor rather than "most-recent-only, no pagination": the
+  bounded most-recent fetch is required either way, so exposing a single `before` cursor is
+  a trivial increment on the mandatory cap and avoids a certain near-term rework ("load
+  older messages" is core chat UX). Heavier history features (full-text search,
+  jump-to-date, unread-anchored loading) remain deferred.
+
 ## Sprint 1 Architecture Focus
 - define API contracts
 - define authentication flow
@@ -193,3 +348,29 @@ Keycloak is that the identifier now comes from the token subject.
 
 ## Scalability Note
 The detailed scalability plan for 1,000,000 users will be discussed separately and will cover sharding, load balancing, data partitioning, and capacity planning.
+
+### Known limits / scaling considerations (recorded, not yet designed)
+These are constraints identified while making the Sprint 1 baseline decisions. They are
+**deliberately not solved here** — they belong to the deferred scalability track and should
+be picked up with performance-engineer (throughput/concurrency targets) before any design.
+Recorded so the baseline's boundaries are on the record.
+
+- **Room count vs. active-room fanout are different problems.** Millions of rooms *in the
+  database* is a normal relational-scale concern (rows in `rooms`/`room_members`/`messages`
+  plus the keyset index); the eventual pressure there is total *message* volume →
+  `messages` table partitioning, not room count. What stresses the **messaging backbone** is
+  the much smaller number of rooms with *live WebSocket subscribers at the same time*.
+- **RabbitMQ queue/binding count is the backbone's soft ceiling.** The CHAT-107 fanout
+  topology (topic exchange + a per-instance/per-subscription queue, via the STOMP broker
+  relay) is comfortable at thousands–tens-of-thousands of concurrently active destinations,
+  but *millions of simultaneously bound destinations* is a known RabbitMQ pain point.
+  Directions to evaluate when this becomes real (sketch only, no decision):
+  consistent-hash exchange / broker sharding; a fixed per-instance queue with room→routing-
+  key hashing and app-side filtering (caps queue/binding count); or revisiting Kafka with a
+  fixed partition count + room-hash partitioning. Choosing among these is deferred work.
+- **Why the baseline doesn't box us in.** Producers publish through the `EventPublisher`
+  abstraction (`platform/common-messaging`), not broker APIs directly; PostgreSQL is the
+  source of truth while the bus is transient delivery; services are stateless; messages
+  already carry a room-scoped routing key. So a future transport/topology change is
+  contained rather than a rewrite — which is the reason the right-sized RabbitMQ was
+  acceptable for the MVP.

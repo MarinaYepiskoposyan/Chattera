@@ -16,17 +16,30 @@
 
   <name>Chattera :: Platform :: Common Messaging</name>
   <description>
-    Event-bus abstraction stub. The messaging backbone technology (RabbitMQ,
-    Kafka, or Redis Streams) is not yet finalized (see solution-architecture.md),
-    so this module only defines the publisher-side contract that chat-service
-    and file-service will implement against once the backbone is chosen.
-    Deliberately has no runtime dependency on any specific broker client yet.
+    Event-bus abstraction (EventPublisher) plus its concrete transport,
+    decided in CHAT-104: RabbitMQ via Spring AMQP (see
+    solution-architecture.md, "Event bus decision - RabbitMQ"). Services that
+    depend on this module and have spring-boot-starter-amqp on the classpath
+    (transitively pulled in here) get an EventPublisher&lt;DomainEvent&gt; bean
+    auto-configured for free, publishing to a shared topic exchange keyed by
+    the caller-supplied routing key - the same auto-configuration pattern
+    common-security uses for JWT handling.
   </description>
 
   <dependencies>
     <dependency>
       <groupId>com.chattera</groupId>
       <artifactId>common-domain</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-amqp</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
     </dependency>
   </dependencies>
 </project>

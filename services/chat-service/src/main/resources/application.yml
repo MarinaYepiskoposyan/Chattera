@@ -2,6 +2,55 @@ spring:
   application:
     name: chat-service
 
+  datasource:
+    # Defaults match devops-engineer's docker-compose Postgres (POSTGRES_DB=chattera,
+    # POSTGRES_USER=chattera) - see .env.example. Override for other environments.
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5432/chattera}
+    username: ${SPRING_DATASOURCE_USERNAME:chattera}
+    password: ${SPRING_DATASOURCE_PASSWORD:changeme_chattera_dev_password}
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      # Flyway owns the schema; Hibernate only ever validates against it.
+      ddl-auto: validate
+    properties:
+      hibernate:
+        format_sql: false
+        # See the "flyway.schemas" comment below - Hibernate needs the same
+        # schema so its generated SQL (validate, and later DML) matches
+        # where Flyway actually created the tables.
+        default_schema: chat_service
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    # chat-service gets its own Postgres schema within the shared `chattera`
+    # database, rather than the default `public` schema profile-service
+    # already occupies there. Both services' V1 migrations are independently
+    # versioned starting at "1", and Flyway's schema-history table isn't
+    # itself namespaced by service - sharing `public` would collide (a
+    # version-1 checksum mismatch against profile-service's own V1) rather
+    # than layering cleanly. `create-schemas: true` (the Spring Boot default)
+    # creates `chat_service` on first run - no manual DDL/infra step needed.
+    schemas: chat_service
+    create-schemas: true
+
+  rabbitmq:
+    host: ${SPRING_RABBITMQ_HOST:localhost}
+    port: ${SPRING_RABBITMQ_PORT:5672}
+    username: ${SPRING_RABBITMQ_USERNAME:chattera}
+    password: ${SPRING_RABBITMQ_PASSWORD:changeme_rabbitmq_dev_password}
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Keycloak realm issuer. Defaults to devops-engineer's local
+          # docker-compose Keycloak (see infra/README.md); override via
+          # KEYCLOAK_ISSUER_URI for other environments.
+          issuer-uri: ${KEYCLOAK_ISSUER_URI:http://localhost:8080/realms/chattera}
+
 server:
   port: 8083
 
@@ -14,3 +63,11 @@ management:
     health:
       probes:
         enabled: true
+  health:
+    # RabbitMQ is transient delivery, not the source of truth (Postgres is -
+    # see solution-architecture.md "The bus is transient delivery"): a
+    # publish failure is logged and must never fail the REST write, so a
+    # broker outage must not flip chat-service's liveness/readiness to DOWN
+    # either - REST + history remain fully functional without it.
+    rabbit:
+      enabled: false

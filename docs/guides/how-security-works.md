@@ -537,7 +537,11 @@ Noted in `docs/solution-architecture.md` and not built yet:
 - **Resource/client-level role mapping** (`resource_access` claim) — only
   realm roles are mapped today; add this only if a concrete authorization
   need for it appears.
-- Gateway/ws-gateway/chat-service/file-service are currently scaffolds only
-  (they don't yet declare `spring-boot-starter-oauth2-resource-server` or
-  wire `common-security`'s converter) — that wiring lands with their own
+- Gateway/ws-gateway/file-service are currently scaffolds only (they don't
+  yet declare `spring-boot-starter-oauth2-resource-server` or wire
+  `common-security`'s converter) — that wiring lands with their own
   implementation tickets, following the same pattern as `profile-service`.
+  `chat-service` (CHAT-104) already did this: identical
+  `SecurityConfig`/converter/`azp`-allowlist wiring, zero extra config beyond
+  its own filter chain - confirms the shared pattern generalizes past the
+  one service it was designed against.
