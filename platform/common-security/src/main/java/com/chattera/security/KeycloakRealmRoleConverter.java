@@ -2,6 +2,7 @@ package com.chattera.security;
 
 import java.util.Collection;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.stream.Collectors;
 
@@ -35,7 +36,7 @@ public class KeycloakRealmRoleConverter implements Converter<Jwt, Collection<Gra
         }
         return roleCollection.stream()
                 .map(Object::toString)
-                .map(role -> new SimpleGrantedAuthority(ROLE_PREFIX + role.toUpperCase()))
+                .map(role -> new SimpleGrantedAuthority(ROLE_PREFIX + role.toUpperCase(Locale.ROOT)))
                 .collect(Collectors.toUnmodifiableSet());
     }
 }

@@ -12,7 +12,8 @@ import com.chattera.profile.domain.Profile;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Exercises the real V1__create_profiles_table.sql Flyway migration against
+ * Exercises the real Flyway migrations (V1__create_profiles_table.sql,
+ * V2__profiles_created_at_timestamptz.sql) against
  * an embedded H2 database (auto-substituted by @DataJpaTest), with Hibernate
  * ddl-auto left at "validate" (as configured in application.yml) so this
  * also confirms the entity mapping matches the migration. Lightweight

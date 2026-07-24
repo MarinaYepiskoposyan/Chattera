@@ -107,4 +107,28 @@ class ProfileControllerTest {
                         .content("{\"displayName\":\"" + tooLong + "\"}"))
                 .andExpect(status().isBadRequest());
     }
+
+    @Test
+    void putMeAcceptsAnHttpsAvatarUrl() throws Exception {
+        Profile updated = new Profile("user-4", null, "https://example.com/a.png", null,
+                Instant.parse("2026-01-01T00:00:00Z"));
+        when(profileService.updateProfile(any(), any())).thenReturn(updated);
+        when(presenceReader.readStatus(eq("user-4"))).thenReturn(PresenceStatus.OFFLINE);
+
+        mockMvc.perform(put("/me")
+                        .with(jwt().jwt(builder -> builder.subject("user-4")))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"avatarUrl\":\"https://example.com/a.png\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.avatarUrl").value("https://example.com/a.png"));
+    }
+
+    @Test
+    void putMeRejectsANonHttpAvatarUrl() throws Exception {
+        mockMvc.perform(put("/me")
+                        .with(jwt().jwt(builder -> builder.subject("user-5")))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"avatarUrl\":\"javascript:alert(1)\"}"))
+                .andExpect(status().isBadRequest());
+    }
 }

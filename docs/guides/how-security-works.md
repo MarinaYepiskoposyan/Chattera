@@ -455,6 +455,19 @@ both clients by design, matching production behavior).
 
 ## 12. Open items / deferred
 
+**Resolved from code review:**
+
+- **`Locale`-dependent role mapping** in `KeycloakRealmRoleConverter` (CHAT-26)
+  — `role.toUpperCase()` had no `Locale`, so under a JVM running in a Turkish
+  locale `"admin".toUpperCase()` produces a dotted-I variant instead of plain
+  `"ADMIN"`, silently breaking `hasRole("ADMIN")` checks. Fixed by passing
+  `Locale.ROOT` explicitly. Covered by `KeycloakRealmRoleConverterTest`.
+- **Presence-read failure isn't isolated** (CHAT-27) — a Redis outage used to
+  fail the entire `/me` read/update instead of degrading presence to
+  unknown/offline. `PresenceReader.readStatus` now catches
+  `RedisConnectionFailureException` and returns `PresenceStatus.UNKNOWN`
+  instead of propagating. Covered by `PresenceReaderTest`.
+
 **Pending fixes from code review (CHAT-103), not yet applied:**
 
 - **JIT-provisioning race condition** (§8) — concurrent first-requests for
@@ -465,12 +478,6 @@ both clients by design, matching production behavior).
   client it was issued to. Owner: solution-architect (shared-pattern
   decision for `common-security`, since other services will copy this
   config).
-- **`Locale`-dependent role mapping** in `KeycloakRealmRoleConverter` —
-  `role.toUpperCase()` with no `Locale.ROOT` can mis-map roles under
-  non-English JVM locales. Owner: developer.
-- **Presence-read failure isn't isolated** — a Redis outage currently fails
-  the entire `/me` read/update instead of degrading presence to
-  unknown/offline. Owner: developer.
 
 Noted in `docs/solution-architecture.md` and not built yet:
 
