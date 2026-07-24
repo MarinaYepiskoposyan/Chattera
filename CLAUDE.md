@@ -93,6 +93,7 @@ The standard flow for a feature is `solution-architect` → `business-analyst` �
 - Keep new code aligned with the service boundaries in the architecture doc (auth, chat, presence, file, gateway) rather than building a monolith, unless the user directs otherwise.
 - Treat `docs/` as the source of truth for scope and design intent not yet superseded by actual implementation.
 - Shared code goes in `platform/` (`common-domain`, `common-security`, `common-messaging`, `common-observability`) and is consumed by `services/*` as regular Maven dependencies, not copy-pasted.
+- `common-security` auto-configures JWT handling for any service that depends on it and sets `issuer-uri`: the `realm_access.roles` → authority converter **and** (CHAT-28) a `JwtDecoder` that validates the token's `azp` (authorized party) against an allowlist of sanctioned Keycloak clients (`chattera.security.jwt.accepted-client-ids`). Services inherit both automatically — do not re-add `aud`/`azp` checks per service. See [docs/guides/how-security-works.md](docs/guides/how-security-works.md) §6.2. Note: a service's own `JwtDecoder` bean overrides the shared one, and web-slice tests still supply their own decoder as they do today.
 
 ### Build/test (Maven multi-module monorepo)
 

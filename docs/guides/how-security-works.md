@@ -154,9 +154,11 @@ endpoint) to check the signature against, since keys can rotate.
 
 Two groups of claims:
 - **Standard OIDC claims**: `iss` (issuer — checked against `issuer-uri`),
-  `sub` (the durable user id — see §8), `aud` (intended audience — **not
-  currently validated**, see the callout in §6), `exp`/`iat` (expiry,
-  ~5 minutes per §2), `azp` (which client requested the token).
+  `sub` (the durable user id — see §8), `aud` (intended audience — here
+  `"account"`, Keycloak's default; **not** used for client-of-origin checks,
+  see §6.2 for why), `exp`/`iat` (expiry, ~5 minutes per §2), `azp` (which
+  client requested the token — **this is the claim Chattera validates** to
+  reject tokens minted for a non-sanctioned client, see §6.1).
 - **Keycloak-specific claims**: `preferred_username`/`name` (used as the
   JIT-provisioning displayName fallback, §8), `realm_access.roles` (mapped
   to Spring authorities, §7).
@@ -270,13 +272,56 @@ in your local `~/.m2` cache, not `services/` or `platform/`); the only
 application code in this whole pipeline is `SecurityConfig`'s 15 lines and
 the `common-security` converter in §7.
 
-**Known gap** (code-reviewer finding, not yet fixed): step 1 above validates
-`iss`/`exp`/signature but not `aud` (audience). Any token issued to *any*
-client in the `chattera` realm is currently accepted by every resource
-server, not just the client it was meant for. Low blast-radius for
-`profile-service` alone (every endpoint only acts on the caller's own
-`sub`), but flagged as a shared-pattern decision for solution-architect
-before other services copy this same `SecurityConfig`.
+### 6.2 Client-of-origin validation: the `azp` allowlist (CHAT-28)
+
+Step 1 above validates `iss`/`exp`/signature — but on its own that accepts
+*any* token from the `chattera` realm, including one minted for a different,
+lower-trust client. code-reviewer flagged this (CHAT-28) as a shared-pattern
+decision, since gateway/chat/file/ws-gateway will all copy `profile-service`'s
+resource-server wiring. It is now fixed once, in `common-security`, so every
+service inherits the fix automatically.
+
+**Why `azp` and not `aud`.** The instinct is "validate the `aud` (audience)
+claim." But grounding this in what Keycloak actually emits (see the token
+sample in §5): with the realm's **default** configuration — no per-service
+"Audience" protocol mappers, which is what `chattera-realm.json` uses — every
+client's token carries `aud: "account"`, not the requesting client's id. So
+`aud` cannot distinguish Chattera's clients from each other; it's the same for
+all of them. The claim that actually identifies *which client a token was
+issued to* is `azp` (authorized party — `azp: "chattera-test-client"` in the
+§5 sample). Validating `azp` against an allowlist is therefore what actually
+rejects the flagged threat. (The alternative — registering each resource
+server as a Keycloak client and adding audience mappers to get a real
+per-service `aud` — is more machinery than Sprint 1's single trust domain
+needs, where every service trusts the same realm and the same frontend client
+set. Revisit only if services ever need distinct trust domains.)
+
+**Where it lives.** `platform/common-security`:
+
+- [`KeycloakAuthorizedPartyValidator`](../../platform/common-security/src/main/java/com/chattera/security/KeycloakAuthorizedPartyValidator.java) —
+  an `OAuth2TokenValidator<Jwt>` that fails closed unless the token's `azp` is
+  in the accepted set (a missing `azp`, or one not in the set, is rejected).
+- [`CommonSecurityProperties`](../../platform/common-security/src/main/java/com/chattera/security/CommonSecurityProperties.java) —
+  binds `chattera.security.jwt.accepted-client-ids`. Defaults to the realm's
+  sanctioned clients: `chattera-web`, `chattera-mobile`, and the dev/test-only
+  `chattera-test-client`. The dev/test client is in the default so the
+  headless smoke-test flow (§10, `infra/README.md`) works with zero
+  per-service config; it's contained to dev/test realms at the Keycloak layer
+  (never promoted to prod), so no production token can ever carry that `azp`.
+  Narrow the list per environment via the property if desired.
+- [`JwtDecoderAutoConfiguration`](../../platform/common-security/src/main/java/com/chattera/security/JwtDecoderAutoConfiguration.java) —
+  builds the service's `JwtDecoder` (`NimbusJwtDecoder` from `issuer-uri`) with
+  the default signature/issuer/expiry validators **plus** the `azp` validator,
+  and registers it `before` Spring Boot's own resource-server auto-config so
+  this decoder is the one used. Gated on `issuer-uri` being set and guarded by
+  `@ConditionalOnMissingBean`, so a service can still supply its own
+  `JwtDecoder`.
+
+Because it's wired through `common-security`'s
+`AutoConfiguration.imports`, no service's `SecurityConfig` has to remember to
+add it — exactly like the role converter in §7. This closes the gap for
+`profile-service` today and for every service that adopts the shared library
+next, without each one reinventing the answer.
 
 ## 7. Mapping token claims to Spring authorities (shared code)
 
@@ -447,6 +492,7 @@ both clients by design, matching production behavior).
 | Realm/client definition | [`infra/keycloak/realm-export/chattera-realm.json`](../infra/keycloak/realm-export/chattera-realm.json) |
 | Local infra (Keycloak container, Postgres, Redis) | [`docker-compose.yml`](../docker-compose.yml), [`infra/README.md`](../infra/README.md) |
 | Role → authority mapping (shared) | [`platform/common-security/src/main/java/com/chattera/security/`](../platform/common-security/src/main/java/com/chattera/security/) |
+| `azp` allowlist validation (shared, §6.2) | [`KeycloakAuthorizedPartyValidator`](../../platform/common-security/src/main/java/com/chattera/security/KeycloakAuthorizedPartyValidator.java), [`CommonSecurityProperties`](../../platform/common-security/src/main/java/com/chattera/security/CommonSecurityProperties.java), [`JwtDecoderAutoConfiguration`](../../platform/common-security/src/main/java/com/chattera/security/JwtDecoderAutoConfiguration.java) |
 | Resource-server wiring (profile-service) | [`services/profile-service/src/main/java/com/chattera/profile/config/SecurityConfig.java`](../services/profile-service/src/main/java/com/chattera/profile/config/SecurityConfig.java) |
 | JIT profile provisioning | [`services/profile-service/src/main/java/com/chattera/profile/service/ProfileService.java`](../services/profile-service/src/main/java/com/chattera/profile/service/ProfileService.java) |
 | `GET`/`PUT /me` routing (`@GetMapping`/`@PutMapping`), `@AuthenticationPrincipal` | [`services/profile-service/src/main/java/com/chattera/profile/web/ProfileController.java`](../services/profile-service/src/main/java/com/chattera/profile/web/ProfileController.java) |
@@ -457,6 +503,11 @@ both clients by design, matching production behavior).
 
 **Resolved from code review:**
 
+- **`azp` (client-of-origin) validation** (CHAT-28, §6.2) — resource servers
+  now reject tokens whose `azp` is not a sanctioned Chattera client, fixed
+  once in `common-security` so every service inherits it. (Superseded the
+  original "no `aud` validation" framing: `aud` is `"account"` for all clients
+  under Keycloak's default config, so `azp` is the correct claim — see §6.2.)
 - **`Locale`-dependent role mapping** in `KeycloakRealmRoleConverter` (CHAT-26)
   — `role.toUpperCase()` had no `Locale`, so under a JVM running in a Turkish
   locale `"admin".toUpperCase()` produces a dotted-I variant instead of plain
@@ -473,11 +524,6 @@ both clients by design, matching production behavior).
 - **JIT-provisioning race condition** (§8) — concurrent first-requests for
   the same new user can 500 instead of gracefully resolving. Owner:
   developer.
-- **No `aud` (audience) claim validation** (§6.1) — every resource server
-  currently accepts any token from the `chattera` realm regardless of which
-  client it was issued to. Owner: solution-architect (shared-pattern
-  decision for `common-security`, since other services will copy this
-  config).
 
 Noted in `docs/solution-architecture.md` and not built yet:
 

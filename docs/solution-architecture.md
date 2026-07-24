@@ -109,8 +109,8 @@ avoids any Keycloak Admin API call or confidential service client for Sprint 1.
 ### Token validation (every Chattera service is a resource server)
 Confirmed: gateway, ws-gateway, chat, file, and profile all use
 `spring-boot-starter-oauth2-resource-server` configured against the Keycloak realm. They
-validate signature (via the realm JWKS), issuer, expiry, and audience locally — no call
-to Keycloak per request, no shared session store. Config shape (per service):
+validate signature (via the realm JWKS), issuer, expiry, and authorized party locally — no
+call to Keycloak per request, no shared session store. Config shape (per service):
 
 ```
 spring:
@@ -127,6 +127,25 @@ token's `realm_access.roles` / `resource_access` claims to Spring authorities vi
 `JwtAuthenticationConverter` (shared config module). The gateway may additionally
 pre-validate at the edge, but each service still validates independently (defense in
 depth; services are not trusted to be reachable only via the gateway).
+
+**Client-of-origin validation — `azp`, not `aud` (decided CHAT-28).** The
+signature/issuer/expiry checks above do not, on their own, constrain *which realm client*
+a token was minted for: any token from the `chattera` realm — including one issued to a
+different, lower-trust client — would otherwise be accepted by every service. Keycloak in
+its default configuration (which is what this realm uses — no per-service "Audience"
+protocol mappers) populates `aud` with `"account"` for every client, so `aud` cannot
+distinguish Chattera's clients; the claim that identifies the requesting client is `azp`
+(authorized party). Rather than register each resource server as a Keycloak client and add
+audience mappers (a real per-service `aud` — over-engineering for Sprint 1's single trust
+domain, where every service trusts the same realm and the same frontend client set), the
+shared `common-security` library adds an `azp` allowlist validator to the `JwtDecoder`,
+auto-configured so every service inherits it the same way the role converter is inherited
+today. Accepted client ids default to the realm's sanctioned set (`chattera-web`,
+`chattera-mobile`, and the dev/test-only `chattera-test-client`) and are overridable per
+environment via `chattera.security.jwt.accepted-client-ids`. See
+[`docs/guides/how-security-works.md`](guides/how-security-works.md) §6.2. Revisit this
+(add real per-service audiences) only if services need to be segmented into distinct trust
+domains — not a Sprint 1 requirement.
 
 ### Refresh, session, and logout
 Keycloak fully replaces the earlier Redis-backed refresh-token design. There is no

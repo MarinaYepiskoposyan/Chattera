@@ -1,1 +1,2 @@
 com.chattera.security.JwtAuthenticationConverterAutoConfiguration
+com.chattera.security.JwtDecoderAutoConfiguration
