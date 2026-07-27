@@ -323,6 +323,55 @@ so a future gateway can front them without rework — e.g. `POST /rooms`,
 `GET /rooms/{roomId}/messages` (history). A future gateway can route `/api/chat/**` to these
 unchanged.
 
+### Inbound message transport — REST to send, WebSocket to receive (decided)
+Sending a message is a **REST POST to chat-service**; the WebSocket (ws-gateway) is
+**receive-only** for messages. The client therefore runs two channels at once: REST for
+writes/commands, the socket for real-time delivery. Rationale:
+- **Decouples CHAT-104 from CHAT-107** — the write path is exercisable over plain HTTP with
+  no WebSocket infrastructure, which is what makes CHAT-104 independently shippable/testable.
+- **Respects the service boundary** — chat-service is the sole owner of writes (authz +
+  persist + publish); a socket-send would force ws-gateway to persist or to call
+  chat-service, dragging the write path into the delivery edge.
+- **Command/ack semantics** — a send has a definite result; REST gives synchronous
+  `201`/`400`/`403`/`413`/`429` with standard middleware (rate limiting, idempotency).
+- **Auth** — REST re-validates the token per request (cheap, local JWT check); a long-lived
+  socket is validated once at CONNECT and can outlive the token TTL.
+- Publish happens **after the DB commit** (e.g. a transaction `afterCommit` hook), never
+  inside the transaction — publishing inside a tx that then rolls back would emit a phantom
+  message. The tiny commit→publish crash gap is what the deferred transactional outbox
+  would close.
+
+Noted alternative (deferred): send over the socket (STOMP `SEND`) for lower send latency /
+single connection. It moves the write entry point into ws-gateway and couples it to
+chat-service, so revisit only if performance-engineer shows a send-latency target REST
+misses. Because producers publish through the `EventPublisher` abstraction, adding a
+socket-send path later lands in the same persist+publish logic — a contained change.
+
+### Real-time delivery runtime & the ws-gateway ↔ chat-service relationship
+The two services have **no direct relationship** — they never call each other. Their only
+link is RabbitMQ: chat-service is the **producer**, ws-gateway is the **consumer**. This
+decoupling is deliberate and is what lets both tiers be stateless and scale independently.
+- **chat-service** = writer / system of record: REST writes, authz, business rules,
+  Postgres persistence, and publishing events. **ws-gateway** = delivery edge: holds live
+  sockets, tracks presence, pushes events to clients. No business logic, no DB.
+- **The contract between them is the event, not an API** — its fields + routing key, defined
+  via `common-messaging`/`common-domain` (`DomainEvent`, e.g. `RoomMessageCreated`). The
+  event is **self-contained** (id, sender, content, timestamp, status), so ws-gateway
+  forwards it without querying Postgres or calling chat-service.
+- **End-to-end loop** (through both, but they never touch directly):
+  `Client --REST POST--> chat-service --publish--> RabbitMQ --route--> ws-gateway --WS push--> Client`.
+  Any chat-service instance can publish; any ws-gateway instance can deliver; the broker
+  bridges any-to-any.
+- **ws-gateway statelessness** — a live socket is unavoidably transient state on one
+  instance, but no *authoritative* state lives there (history→Postgres, presence→Redis,
+  routing→RabbitMQ, identity→the JWT). If an instance dies, the client reconnects to **any**
+  other instance (no sticky sessions), re-CONNECTs, re-SUBSCRIBEs, and re-fetches recent
+  history — nothing is lost. A message sent during the reconnect gap is missed on the socket
+  but recovered from history, which is again why persist-first + Postgres-as-source-of-truth
+  matters. (Consumer queue topology to avoid the single-shared-queue "competing consumers"
+  trap is a CHAT-107 concern — each ws-gateway instance needs its own queue bound to the
+  exchange, handled by the STOMP broker relay, not one shared queue.)
+
 ### Message history pagination (applies to BOTH rooms CHAT-104 and DMs CHAT-105)
 Decided once, consistently. History is returned **bounded, newest-first, with an optional
 keyset (cursor) parameter for loading older messages** — not offset pagination, and not an
