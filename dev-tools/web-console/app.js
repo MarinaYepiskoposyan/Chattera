@@ -345,10 +345,11 @@ async function openRoom(room) {
   document.getElementById("chat-empty-state").style.display = "none";
   document.getElementById("messages-panel").style.display = "flex";
   document.getElementById("messages-room-name").textContent = room.name;
+  document.getElementById("members-panel").style.display = "none";
   document.querySelectorAll("#room-list li").forEach((li) => {
     li.classList.toggle("active", li.dataset.roomId === String(room.id));
   });
-  await loadMessages();
+  await Promise.all([loadMessages(), loadMembers()]);
 }
 
 async function loadMessages() {
@@ -407,6 +408,59 @@ function renderMessages(messages) {
   }
   list.scrollTop = list.scrollHeight;
 }
+
+// ---------------------------------------------------------------------------
+// Room members panel
+// ---------------------------------------------------------------------------
+
+async function loadMembers() {
+  if (!selectedRoom) return;
+  clearError("members-error");
+  try {
+    const members = await apiFetch(`${CONFIG.chatServiceBaseUrl}/rooms/${selectedRoom.id}/members`);
+    renderMembers(members);
+  } catch (err) {
+    showError("members-error", err);
+  }
+}
+
+function renderMembers(members) {
+  const list = document.getElementById("member-list");
+  list.innerHTML = "";
+  const currentUserId = getCurrentUserId();
+  for (const member of members) {
+    const li = document.createElement("li");
+
+    const avatar = document.createElement("span");
+    avatar.className = "member-avatar";
+    avatar.textContent = member.userId ? member.userId.slice(0, 1).toUpperCase() : "?";
+    li.appendChild(avatar);
+
+    const userId = document.createElement("span");
+    userId.className = "member-userid";
+    userId.textContent = member.userId === currentUserId ? `${member.userId} (you)` : member.userId;
+    userId.title = member.userId;
+    li.appendChild(userId);
+
+    const roleBadge = document.createElement("span");
+    roleBadge.className = `member-role-badge ${member.role === "OWNER" ? "owner" : "member"}`;
+    roleBadge.textContent = member.role;
+    li.appendChild(roleBadge);
+
+    list.appendChild(li);
+  }
+
+  document.getElementById("toggle-members-btn").textContent = `Members (${members.length})`;
+}
+
+function toggleMembersPanel() {
+  const panel = document.getElementById("members-panel");
+  panel.style.display = panel.style.display === "none" ? "block" : "none";
+}
+
+// ---------------------------------------------------------------------------
+// Messages panel (post form)
+// ---------------------------------------------------------------------------
 
 async function submitPostMessageForm(event) {
   event.preventDefault();
@@ -470,6 +524,7 @@ async function init() {
   document.getElementById("create-room-form").addEventListener("submit", submitCreateRoomForm);
   document.getElementById("refresh-rooms-btn").addEventListener("click", loadRooms);
   document.getElementById("post-message-form").addEventListener("submit", submitPostMessageForm);
+  document.getElementById("toggle-members-btn").addEventListener("click", toggleMembersPanel);
 
   await handleCallbackIfPresent();
   render();

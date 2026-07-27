@@ -72,7 +72,14 @@
     <section class="chat-area">
       <div id="messages-panel" class="messages-panel" style="display:none">
         <header class="messages-header">
-          <h2><span class="room-hash">#</span><span id="messages-room-name"></span></h2>
+          <div class="messages-header-row">
+            <h2><span class="room-hash">#</span><span id="messages-room-name"></span></h2>
+            <button id="toggle-members-btn" class="btn btn-ghost" type="button">Members</button>
+          </div>
+          <div id="members-panel" class="members-panel" style="display:none">
+            <div id="members-error" class="inline-error" style="display:none"></div>
+            <ul id="member-list" class="member-list"></ul>
+          </div>
         </header>
         <div id="messages-error" class="inline-error" style="display:none"></div>
         <ul id="message-list" class="message-list"></ul>

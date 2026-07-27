@@ -15,6 +15,9 @@ public interface RoomMemberRepository extends JpaRepository<RoomMember, RoomMemb
 
     List<RoomMember> findByUserId(String userId);
 
+    /** Full membership listing for a room, oldest-joined first - see {@code RoomMemberService}. */
+    List<RoomMember> findByRoomIdOrderByJoinedAtAsc(UUID roomId);
+
     /**
      * The earliest-joined remaining member other than {@code excludedUserId}
      * - used to pick who ownership transfers to when the current OWNER

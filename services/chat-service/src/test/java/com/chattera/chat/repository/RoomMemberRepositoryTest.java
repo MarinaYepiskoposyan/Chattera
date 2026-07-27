@@ -1,6 +1,7 @@
 package com.chattera.chat.repository;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -52,6 +53,29 @@ class RoomMemberRepositoryTest {
                 roomMemberRepository.findFirstByRoomIdAndUserIdNotOrderByJoinedAtAsc(room.getId(), "owner");
 
         assertThat(nextOwner).isEmpty();
+    }
+
+    @Test
+    void findByRoomIdOrderByJoinedAtAscReturnsAllMembersOldestFirst() {
+        Room room = roomRepository.save(new Room(UUID.randomUUID(), "room", RoomType.PUBLIC, "owner", Instant.now()));
+        Instant base = Instant.parse("2026-01-01T00:00:00Z");
+        roomMemberRepository.save(new RoomMember(room.getId(), "owner", RoomRole.OWNER, base));
+        roomMemberRepository.save(new RoomMember(room.getId(), "second-joined", RoomRole.MEMBER, base.plusSeconds(60)));
+        roomMemberRepository.save(new RoomMember(room.getId(), "first-joined", RoomRole.MEMBER, base.plusSeconds(30)));
+
+        List<RoomMember> members = roomMemberRepository.findByRoomIdOrderByJoinedAtAsc(room.getId());
+
+        assertThat(members).extracting(RoomMember::getUserId)
+                .containsExactly("owner", "first-joined", "second-joined");
+    }
+
+    @Test
+    void findByRoomIdOrderByJoinedAtAscIsEmptyForARoomWithNoMembers() {
+        Room room = roomRepository.save(new Room(UUID.randomUUID(), "room", RoomType.PUBLIC, "owner", Instant.now()));
+
+        List<RoomMember> members = roomMemberRepository.findByRoomIdOrderByJoinedAtAsc(room.getId());
+
+        assertThat(members).isEmpty();
     }
 
     @Test
