@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Chattera Dev Console</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>Chattera Dev Console</h1>
+    <div id="auth-bar">
+      <span id="auth-status">Logged out</span>
+      <button id="login-btn">Log in</button>
+      <button id="logout-btn" style="display:none">Log out</button>
+    </div>
+  </header>
+
+  <div id="global-error" class="error" style="display:none"></div>
+
+  <main id="app" style="display:none">
+    <section id="profile-panel" class="panel">
+      <h2>Profile</h2>
+      <div id="profile-error" class="error" style="display:none"></div>
+      <dl id="profile-view"></dl>
+      <h3>Update profile</h3>
+      <form id="profile-form">
+        <label>Display name <input type="text" id="profile-displayName"></label>
+        <label>Avatar URL <input type="text" id="profile-avatarUrl"></label>
+        <label>Timezone <input type="text" id="profile-timezone"></label>
+        <button type="submit">Save</button>
+      </form>
+    </section>
+
+    <section id="rooms-panel" class="panel">
+      <h2>Rooms</h2>
+      <div id="rooms-error" class="error" style="display:none"></div>
+      <form id="create-room-form">
+        <label>Name <input type="text" id="room-name" required></label>
+        <label>Type
+          <select id="room-type">
+            <option value="PUBLIC">PUBLIC</option>
+            <option value="PRIVATE">PRIVATE</option>
+          </select>
+        </label>
+        <button type="submit">Create room</button>
+      </form>
+      <button id="refresh-rooms-btn">Refresh rooms</button>
+      <ul id="room-list"></ul>
+    </section>
+
+    <section id="messages-panel" class="panel" style="display:none">
+      <h2>Room: <span id="messages-room-name"></span></h2>
+      <div id="messages-error" class="error" style="display:none"></div>
+      <ul id="message-list"></ul>
+      <form id="post-message-form">
+        <input type="text" id="message-content" placeholder="Say something..." required>
+        <button type="submit">Send</button>
+      </form>
+    </section>
+  </main>
+
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
