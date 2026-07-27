@@ -184,12 +184,15 @@ async function loadProfile() {
 function renderProfile(profile) {
   const dl = document.getElementById("profile-view");
   dl.innerHTML = "";
+  // Order matters: the first two fields are the ones shown in the compact
+  // sidebar summary (see .profile-view CSS), the rest are kept in the DOM
+  // but hidden there — still useful if this markup is ever expanded.
   const fields = [
-    ["User ID", profile.userId],
     ["Display name", profile.displayName],
+    ["Status", profile.status],
+    ["User ID", profile.userId],
     ["Avatar URL", profile.avatarUrl],
     ["Timezone", profile.timezone],
-    ["Status", profile.status],
     ["Created at", profile.createdAt],
   ];
   for (const [label, value] of fields) {
@@ -201,6 +204,10 @@ function renderProfile(profile) {
     dl.appendChild(dd);
   }
 
+  const avatar = document.getElementById("profile-avatar");
+  const initialsSource = (profile.displayName || profile.userId || "?").trim();
+  avatar.textContent = initialsSource ? initialsSource.slice(0, 1).toUpperCase() : "?";
+
   document.getElementById("profile-displayName").value = profile.displayName || "";
   document.getElementById("profile-avatarUrl").value = profile.avatarUrl || "";
   document.getElementById("profile-timezone").value = profile.timezone || "";
@@ -209,11 +216,13 @@ function renderProfile(profile) {
 async function submitProfileForm(event) {
   event.preventDefault();
   clearError("profile-error");
+  const submitBtn = event.target.querySelector('button[type="submit"]');
   const body = {
     displayName: document.getElementById("profile-displayName").value || null,
     avatarUrl: document.getElementById("profile-avatarUrl").value || null,
     timezone: document.getElementById("profile-timezone").value || null,
   };
+  submitBtn.disabled = true;
   try {
     const profile = await apiFetch(`${CONFIG.profileServiceBaseUrl}/me`, {
       method: "PUT",
@@ -222,6 +231,8 @@ async function submitProfileForm(event) {
     renderProfile(profile);
   } catch (err) {
     showError("profile-error", err);
+  } finally {
+    submitBtn.disabled = false;
   }
 }
 
@@ -246,15 +257,24 @@ function renderRooms(rooms) {
   list.innerHTML = "";
   for (const room of rooms) {
     const li = document.createElement("li");
+    li.dataset.roomId = String(room.id);
+    if (selectedRoom && String(selectedRoom.id) === String(room.id)) {
+      li.classList.add("active");
+    }
 
     const link = document.createElement("a");
     link.href = "#";
-    link.textContent = `${room.name} (${room.type})`;
+    link.textContent = room.name;
     link.addEventListener("click", (e) => {
       e.preventDefault();
       openRoom(room);
     });
     li.appendChild(link);
+
+    const typeBadge = document.createElement("span");
+    typeBadge.className = "badge";
+    typeBadge.textContent = room.type;
+    li.appendChild(typeBadge);
 
     const badge = document.createElement("span");
     badge.className = "badge";
@@ -273,8 +293,10 @@ function renderRooms(rooms) {
 async function submitCreateRoomForm(event) {
   event.preventDefault();
   clearError("rooms-error");
+  const submitBtn = event.target.querySelector('button[type="submit"]');
   const name = document.getElementById("room-name").value;
   const type = document.getElementById("room-type").value;
+  submitBtn.disabled = true;
   try {
     await apiFetch(`${CONFIG.chatServiceBaseUrl}/rooms`, {
       method: "POST",
@@ -284,6 +306,8 @@ async function submitCreateRoomForm(event) {
     await loadRooms();
   } catch (err) {
     showError("rooms-error", err);
+  } finally {
+    submitBtn.disabled = false;
   }
 }
 
@@ -305,6 +329,7 @@ async function leaveRoom(roomId) {
     if (selectedRoom && selectedRoom.id === roomId) {
       selectedRoom = null;
       document.getElementById("messages-panel").style.display = "none";
+      document.getElementById("chat-empty-state").style.display = "flex";
     }
   } catch (err) {
     showError("rooms-error", err);
@@ -317,8 +342,12 @@ async function leaveRoom(roomId) {
 
 async function openRoom(room) {
   selectedRoom = room;
-  document.getElementById("messages-panel").style.display = "block";
+  document.getElementById("chat-empty-state").style.display = "none";
+  document.getElementById("messages-panel").style.display = "flex";
   document.getElementById("messages-room-name").textContent = room.name;
+  document.querySelectorAll("#room-list li").forEach((li) => {
+    li.classList.toggle("active", li.dataset.roomId === String(room.id));
+  });
   await loadMessages();
 }
 
@@ -333,28 +362,58 @@ async function loadMessages() {
   }
 }
 
+function getCurrentUserId() {
+  const tokens = getTokens();
+  if (!tokens || !tokens.access_token) return null;
+  try {
+    return decodeJwtPayload(tokens.access_token).sub;
+  } catch (e) {
+    return null;
+  }
+}
+
+function formatTimestamp(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+}
+
 function renderMessages(messages) {
   const list = document.getElementById("message-list");
   list.innerHTML = "";
+  const currentUserId = getCurrentUserId();
   // API returns newest-first; show oldest-first like a normal chat transcript.
   const ordered = [...messages].reverse();
   for (const message of ordered) {
-    const li = document.createElement("li");
-    const meta = document.createElement("span");
+    const isOwn = currentUserId != null && message.senderId === currentUserId;
+
+    const row = document.createElement("li");
+    row.className = `message-row ${isOwn ? "own" : "other"}`;
+
+    const meta = document.createElement("div");
     meta.className = "message-meta";
-    meta.textContent = `[${message.createdAt}] ${message.senderId}: `;
-    const content = document.createElement("span");
-    content.textContent = message.content;
-    li.appendChild(meta);
-    li.appendChild(content);
-    list.appendChild(li);
+    const sender = document.createElement("span");
+    sender.className = "sender";
+    sender.textContent = isOwn ? "You" : message.senderId;
+    meta.appendChild(sender);
+    meta.appendChild(document.createTextNode(` · ${formatTimestamp(message.createdAt)}`));
+
+    const bubble = document.createElement("div");
+    bubble.className = "message-bubble";
+    bubble.textContent = message.content;
+
+    row.appendChild(meta);
+    row.appendChild(bubble);
+    list.appendChild(row);
   }
+  list.scrollTop = list.scrollHeight;
 }
 
 async function submitPostMessageForm(event) {
   event.preventDefault();
   clearError("messages-error");
+  const submitBtn = event.target.querySelector('button[type="submit"]');
   const input = document.getElementById("message-content");
+  submitBtn.disabled = true;
   try {
     await apiFetch(`${CONFIG.chatServiceBaseUrl}/rooms/${selectedRoom.id}/messages`, {
       method: "POST",
@@ -364,6 +423,8 @@ async function submitPostMessageForm(event) {
     await loadMessages();
   } catch (err) {
     showError("messages-error", err);
+  } finally {
+    submitBtn.disabled = false;
   }
 }
 
@@ -374,6 +435,7 @@ async function submitPostMessageForm(event) {
 function render() {
   const tokens = getTokens();
   const app = document.getElementById("app");
+  const loginHero = document.getElementById("login-hero");
   const status = document.getElementById("auth-status");
   const loginBtn = document.getElementById("login-btn");
   const logoutBtn = document.getElementById("logout-btn");
@@ -385,16 +447,18 @@ function render() {
     } catch (e) {
       // ignore decode failure, keep placeholder
     }
-    status.textContent = `Logged in as ${username}`;
+    status.textContent = username;
     loginBtn.style.display = "none";
     logoutBtn.style.display = "inline-block";
-    app.style.display = "block";
+    loginHero.style.display = "none";
+    app.style.display = "flex";
     loadProfile();
     loadRooms();
   } else {
-    status.textContent = "Logged out";
+    status.textContent = "";
     loginBtn.style.display = "inline-block";
     logoutBtn.style.display = "none";
+    loginHero.style.display = "flex";
     app.style.display = "none";
   }
 }

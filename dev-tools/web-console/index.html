@@ -2,60 +2,88 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Chattera Dev Console</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <header>
-    <h1>Chattera Dev Console</h1>
-    <div id="auth-bar">
-      <span id="auth-status">Logged out</span>
-      <button id="login-btn">Log in</button>
-      <button id="logout-btn" style="display:none">Log out</button>
+  <div id="global-error" class="toast toast-error" style="display:none"></div>
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">C</span>
+      <span class="brand-name">Chattera<span class="brand-tag">dev console</span></span>
+    </div>
+    <div id="auth-bar" class="auth-bar">
+      <span id="auth-status" class="auth-status"></span>
+      <button id="login-btn" class="btn btn-primary">Log in</button>
+      <button id="logout-btn" class="btn btn-ghost" style="display:none">Log out</button>
     </div>
   </header>
 
-  <div id="global-error" class="error" style="display:none"></div>
+  <div id="login-hero" class="login-hero">
+    <div class="login-card">
+      <span class="login-mark">C</span>
+      <h1>Welcome to Chattera</h1>
+      <p>Sign in with your Keycloak account to view rooms, manage your profile, and start chatting.</p>
+    </div>
+  </div>
 
-  <main id="app" style="display:none">
-    <section id="profile-panel" class="panel">
-      <h2>Profile</h2>
-      <div id="profile-error" class="error" style="display:none"></div>
-      <dl id="profile-view"></dl>
-      <h3>Update profile</h3>
-      <form id="profile-form">
-        <label>Display name <input type="text" id="profile-displayName"></label>
-        <label>Avatar URL <input type="text" id="profile-avatarUrl"></label>
-        <label>Timezone <input type="text" id="profile-timezone"></label>
-        <button type="submit">Save</button>
-      </form>
-    </section>
-
-    <section id="rooms-panel" class="panel">
-      <h2>Rooms</h2>
-      <div id="rooms-error" class="error" style="display:none"></div>
-      <form id="create-room-form">
-        <label>Name <input type="text" id="room-name" required></label>
-        <label>Type
-          <select id="room-type">
-            <option value="PUBLIC">PUBLIC</option>
-            <option value="PRIVATE">PRIVATE</option>
+  <main id="app" class="app-shell" style="display:none">
+    <aside class="sidebar">
+      <section id="rooms-panel" class="panel rooms-panel">
+        <div class="panel-header">
+          <h2>Rooms</h2>
+          <button id="refresh-rooms-btn" class="icon-btn" type="button" title="Refresh rooms" aria-label="Refresh rooms">&#8635;</button>
+        </div>
+        <div id="rooms-error" class="inline-error" style="display:none"></div>
+        <ul id="room-list" class="room-list"></ul>
+        <form id="create-room-form" class="create-room-form">
+          <input type="text" id="room-name" placeholder="New room name" required>
+          <select id="room-type" title="Room type">
+            <option value="PUBLIC">Public</option>
+            <option value="PRIVATE">Private</option>
           </select>
-        </label>
-        <button type="submit">Create room</button>
-      </form>
-      <button id="refresh-rooms-btn">Refresh rooms</button>
-      <ul id="room-list"></ul>
-    </section>
+          <button type="submit" class="btn btn-secondary btn-block">+ Create room</button>
+        </form>
+      </section>
 
-    <section id="messages-panel" class="panel" style="display:none">
-      <h2>Room: <span id="messages-room-name"></span></h2>
-      <div id="messages-error" class="error" style="display:none"></div>
-      <ul id="message-list"></ul>
-      <form id="post-message-form">
-        <input type="text" id="message-content" placeholder="Say something..." required>
-        <button type="submit">Send</button>
-      </form>
+      <section id="profile-panel" class="panel profile-panel">
+        <div class="panel-header">
+          <h2>Profile</h2>
+        </div>
+        <div id="profile-error" class="inline-error" style="display:none"></div>
+        <div class="profile-summary">
+          <div id="profile-avatar" class="avatar-circle">?</div>
+          <dl id="profile-view" class="profile-view"></dl>
+        </div>
+        <details class="profile-edit">
+          <summary>Edit profile</summary>
+          <form id="profile-form">
+            <label>Display name <input type="text" id="profile-displayName"></label>
+            <label>Avatar URL <input type="text" id="profile-avatarUrl"></label>
+            <label>Timezone <input type="text" id="profile-timezone"></label>
+            <button type="submit" class="btn btn-secondary btn-block">Save</button>
+          </form>
+        </details>
+      </section>
+    </aside>
+
+    <section class="chat-area">
+      <div id="messages-panel" class="messages-panel" style="display:none">
+        <header class="messages-header">
+          <h2><span class="room-hash">#</span><span id="messages-room-name"></span></h2>
+        </header>
+        <div id="messages-error" class="inline-error" style="display:none"></div>
+        <ul id="message-list" class="message-list"></ul>
+        <form id="post-message-form" class="post-message-form">
+          <input type="text" id="message-content" placeholder="Message..." required autocomplete="off">
+          <button type="submit" class="btn btn-primary">Send</button>
+        </form>
+      </div>
+      <div id="chat-empty-state" class="empty-state">
+        <p>Select a room from the sidebar to view messages.</p>
+      </div>
     </section>
   </main>
 
