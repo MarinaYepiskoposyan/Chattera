@@ -65,7 +65,13 @@ Core flows:
   with `Authorization: Bearer <access token>`; profile row is created just-in-time on first
   authenticated request, keyed by the token `sub`.
 
-The detailed scalability plan (sharding, partitioning, capacity planning for 1M users) is explicitly deferred and not yet designed — don't assume a specific scaling approach beyond the baseline above.
+The detailed scalability/HA design for 1M users (CHAT-24) now exists in the "Scalability &
+High-Availability Architecture" section of [docs/solution-architecture.md](docs/solution-architecture.md):
+Kubernetes + managed L7 LBs, instance-per-service HA PostgreSQL with PgBouncer + read replicas
++ RANGE-partitioned `messages`, a broadcast-queue-per-ws-gateway-pod RabbitMQ topology (Kafka
+as the named escalation trigger), and clustered Keycloak/Redis. It is a **design, not yet
+implemented** — the running system is still single-instance docker-compose. Multi-region,
+cross-cluster message sharding, and exact capacity numbers remain deferred (see §8 there).
 
 ## Sprint 1 Scope
 

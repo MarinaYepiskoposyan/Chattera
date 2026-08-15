@@ -395,31 +395,431 @@ unbounded "return everything" fetch.
 - create baseline deployment and observability setup
 - establish integration points between chat and file services
 
-## Scalability Note
-The detailed scalability plan for 1,000,000 users will be discussed separately and will cover sharding, load balancing, data partitioning, and capacity planning.
+## Scalability & High-Availability Architecture (CHAT-24)
+This is the real scalability/HA design for the system as actually built (Java 21 / Spring
+Boot 3.5.x; gateway, ws-gateway, profile-service, chat-service, file-service; single-instance
+PostgreSQL / Redis / RabbitMQ / Keycloak; docker-compose only, nothing deployed to any cloud).
+It **supersedes** the earlier "Known limits / scaling considerations" placeholder that lived
+here (that section recorded the problems; this section decides them).
 
-### Known limits / scaling considerations (recorded, not yet designed)
-These are constraints identified while making the Sprint 1 baseline decisions. They are
-**deliberately not solved here** — they belong to the deferred scalability track and should
-be picked up with performance-engineer (throughput/concurrency targets) before any design.
-Recorded so the baseline's boundaries are on the record.
+**Scope of this pass.** Target NFR: up to 1,000,000 registered users with low-latency
+delivery and high availability (FR-05, NFRs). It fixes the topology and the mechanisms and is
+meant to be buildable by developer/devops-engineer, not a survey of options. **Multi-region is
+explicitly still deferred** (see §8); the availability target for this pass is
+**single-region, multi-AZ, no single point of failure**.
 
-- **Room count vs. active-room fanout are different problems.** Millions of rooms *in the
-  database* is a normal relational-scale concern (rows in `rooms`/`room_members`/`messages`
-  plus the keyset index); the eventual pressure there is total *message* volume →
-  `messages` table partitioning, not room count. What stresses the **messaging backbone** is
-  the much smaller number of rooms with *live WebSocket subscribers at the same time*.
-- **RabbitMQ queue/binding count is the backbone's soft ceiling.** The CHAT-107 fanout
-  topology (topic exchange + a per-instance/per-subscription queue, via the STOMP broker
-  relay) is comfortable at thousands–tens-of-thousands of concurrently active destinations,
-  but *millions of simultaneously bound destinations* is a known RabbitMQ pain point.
-  Directions to evaluate when this becomes real (sketch only, no decision):
-  consistent-hash exchange / broker sharding; a fixed per-instance queue with room→routing-
-  key hashing and app-side filtering (caps queue/binding count); or revisiting Kafka with a
-  fixed partition count + room-hash partitioning. Choosing among these is deferred work.
-- **Why the baseline doesn't box us in.** Producers publish through the `EventPublisher`
-  abstraction (`platform/common-messaging`), not broker APIs directly; PostgreSQL is the
-  source of truth while the bus is transient delivery; services are stateless; messages
-  already carry a room-scoped routing key. So a future transport/topology change is
-  contained rather than a rewrite — which is the reason the right-sized RabbitMQ was
-  acceptable for the MVP.
+**Reconciled against performance-engineer's CHAT-110 targets (2026-07-27).** The concrete
+numbers that were pending when this section was first written have landed and have been folded
+into the tunables below (they are no longer placeholders). The targets used throughout this
+section:
+- **Concurrency:** ~50,000 peak concurrent active users; **~60,000 peak concurrent WebSocket
+  connections** (multi-device factor).
+- **Message rate:** ~**400 msg/sec sustained** system-wide, **1,500–2,000 msg/sec burst**.
+  Fanout mix 60% DM (fanout=1) / 40% room (avg fanout ~6) → ~**1,200 WS push events/sec
+  sustained, 3,000–6,000 burst** (post-fanout, delivered locally per pod).
+- **REST:** ~**1,400–1,800 req/sec sustained**, ~**3,000 req/sec burst**.
+- **Latency:** end-to-end send-to-delivery **p95 ≤ 500 ms, p99 ≤ 1000 ms** (once CHAT-107 exists).
+- **Availability:** **99.9%** (99.95% is a flagged stretch, *not* a Sprint-1 commitment);
+  **RPO ≤ 5 s** on Postgres (the real durability guarantee); **RTO ≤ 5 min** for AZ-level
+  DB/broker failover.
+- **Keycloak:** ~**180–200 token-refresh req/sec** sustained at peak (driven by the 5-min
+  access-token TTL).
+
+**Net effect of the reconciliation:** the topology and every mechanism hold unchanged — the
+numbers land comfortably inside the design's headroom. **One material change:** the `messages`
+partition interval moves from "monthly" to **daily** (§2), because 400 msg/sec sustained makes
+a monthly partition a ~1B-row object, which defeats partitioning. Everything else is a tunable
+now filled with a real value (HPA thresholds, per-pod socket ceiling, pool sizes, replica
+counts, the §3 Kafka trigger). **Two risks surfaced by CHAT-110 are recorded, not silently
+absorbed:** unbounded room membership (§3, mega-room fanout) and default HikariCP pool sizing
+(§2.2).
+
+**Runtime platform (decided for this pass).** Container orchestration on **Kubernetes**
+(managed — GKE, matching the notional GCP target; kept cloud-portable). Every Chattera
+service is already a stateless Spring Boot container, so each becomes a k8s `Deployment` with
+a `HorizontalPodAutoscaler`. devops-engineer owns the actual cluster/IaC and the CHAT-108
+pipeline that builds/ships these images; this section owns the *shape*.
+
+### 0. Topology at a glance
+```
+                         (managed, multi-AZ, HA cloud LBs)
+  clients ──HTTPS──> [L7 LB: api.chattera]  ──> gateway Deployment (N pods, HPA)
+          ──WSS───> [L7 LB: ws.chattera, WS-upgrade + long idle timeout]
+                                              └─> ws-gateway Deployment (M pods, HPA on conns)
+          ──HTTPS──> [L7 LB: auth.chattera]  ──> Keycloak StatefulSet (3 nodes, Infinispan)
+
+  gateway ─routes─> profile-service / chat-service / file-service (each Deployment + HPA)
+
+  writes/reads ─> PgBouncer ─> PostgreSQL (per-service cluster: primary + replica(s), multi-AZ)
+  presence/cache ─> Redis (managed HA / Cluster, multi-AZ)
+  events ─> RabbitMQ (3-node cluster, multi-AZ) ── one broadcast queue per ws-gateway pod
+  files ─> cloud object storage (GCS/S3) via presigned URLs (MinIO is dev-only)
+```
+
+### 1. Compute scaling & load balancing
+**Load balancers (new — none exist today).** Three managed L7 load balancers, preserving the
+REST/WebSocket separation that is already an architecture principle:
+- `api.chattera` → **gateway** (REST). L7, least-request, path/host routing to the backing
+  services. This is also where edge rate-limiting/TLS terminate.
+- `ws.chattera` → **ws-gateway** (WebSocket). Must permit HTTP `Upgrade` and carry **long idle
+  timeouts** (sockets live for hours) and **connection draining** on pod removal. Balancing is
+  **least-connection**, not round-robin — long-lived connections make round-robin pile onto
+  whichever pod came up first.
+- `auth.chattera` → **Keycloak** (§4).
+
+**The stateless services (gateway, profile, chat, file) scale by just adding pods.** This is
+the payoff of decisions already made and it needs **no change**: JWT validation is local
+against the cached realm JWKS (no per-request Keycloak call, §"Token validation"), there is no
+server-side HTTP session, and the `azp` check is per-instance and offline. So horizontal scale
+is purely: `Deployment.replicas` + `HorizontalPodAutoscaler`. HPA signal is CPU + p95 latency
+(request-bound services). **Tuned to CHAT-110:** target **CPU ~65%** and scale to hold the p95
+latency budget (§Reconciled: p95 ≤ 500 ms end-to-end, of which the REST tier owns a fraction).
+Sizing anchor is **~1,400–1,800 req/sec sustained, ~3,000 req/sec burst** across gateway +
+backing services; run a floor of **≥3 pods per Deployment spread across 3 AZs** (so a single-AZ
+loss still leaves ≥2), and let HPA add pods toward the burst target. These are request-bound
+and CPU-light per request (local JWT validation, no per-request Keycloak call), so the floor is
+driven by AZ-redundancy, not throughput.
+
+**Health/readiness (new, required for LB + k8s).** Enable Spring Boot's liveness/readiness
+probe groups and wire them:
+- `livenessState` → k8s `livenessProbe` (restart a wedged pod).
+- `readinessState` → k8s `readinessProbe` **and** LB health check. Readiness must go `DOWN`
+  when a required downstream (DB for profile/chat, broker for ws-gateway) is unreachable, so
+  the LB stops routing to a pod that can't serve — Spring Boot health *groups* express this.
+- Set `server.shutdown=graceful` + a termination grace period so in-flight requests drain on
+  scale-in/rollout. This is a config addition per service, not a redesign.
+
+**ws-gateway needs its own treatment** because it holds live WebSocket connections — the one
+piece of transient per-instance state in the system. The design already established for
+CHAT-107 holds and is what makes this tractable; scaling it is mostly *operational*:
+- **No sticky sessions.** A socket is transient, not authoritative (history→Postgres,
+  presence→Redis, routing→RabbitMQ, identity→JWT). A client can (re)connect to **any** pod,
+  re-CONNECT / re-SUBSCRIBE / re-fetch recent history, and lose nothing. **This does not
+  change at scale** and is the property that makes ws-gateway horizontally scalable and
+  drain-safe.
+- **Scale on connection count, not CPU.** Idle sockets are cheap on CPU but bound by memory /
+  file descriptors. HPA (or KEDA) drives off an exported **active-connection-count** metric
+  with a per-pod ceiling. **Tuned to CHAT-110** (~60,000 peak concurrent WS connections): set a
+  **per-pod ceiling of ~20,000 sockets** (conservative — idle Netty/STOMP sockets run
+  ~50–100 KB heap each, so ~20k ≈ 1–2 GB; requires the pod's `ulimit -n` raised to ~65k, well
+  above k8s defaults). HPA target **~70% of the ceiling (~14,000 sockets/pod)** → at 60k peak
+  that is ~**5 pods** actively serving; run a **floor of ≥6 pods across 3 AZs** so a single-AZ
+  loss (down to ~4 pods ≈ 15k/pod) still sits under the ceiling. The 20k figure is deliberately
+  conservative and stays a load-test tunable — raise it if soak tests show headroom.
+- **Drain = disconnect-with-reconnect.** On scale-in/rollout, a pod stops accepting new
+  sockets, sends a close/`reconnect` directive to its clients, and lets the LB drain; clients
+  reconnect elsewhere losslessly (same reconnect path as a crash). Safe precisely because of
+  persist-first + Postgres-as-source-of-truth.
+- **Rebalancing after scale-out.** New pods start empty; existing sockets don't migrate. A
+  bounded **max-connection-age** (client reconnects periodically) plus least-connection LB
+  spreads load onto new pods over time. Tunable; note it, don't over-engineer it.
+
+### 2. Database scaling (supersedes single-instance / schema-per-service co-location)
+Today: one PostgreSQL instance, profile-service and chat-service on **separate schemas within
+it** (CHAT-31). Three changes, in escalation order:
+
+1. **Split co-located schemas into an instance-per-service.** profile and chat get **separate
+   PostgreSQL clusters**. Their volume and scaling profiles diverge hard (profiles: ~1M rows,
+   read-mostly, tiny; messages: unbounded append-heavy growth), and co-location couples their
+   failure and scaling domains. This is cheap because the **schema-per-service boundary was
+   deliberately kept clean** — no cross-schema joins or FKs — so the split is a
+   connection-string/Flyway-target change, **not a code change**. (Keycloak's DB is already
+   separate.) The *boundary* is unchanged; only the *co-location* ends.
+2. **Connection pooling with PgBouncer (transaction mode) in front of each cluster.** At
+   `services × pods × Hikari-pool-size`, raw Postgres backends (heavyweight, practical ceiling
+   a few hundred) are exhausted long before the DB is actually busy. PgBouncer in
+   **transaction pooling** multiplexes many client connections onto few server connections.
+   **Developer caveat:** transaction-mode pooling forbids session-scoped state — disable
+   Hibernate server-side prepared-statement caching (or run PgBouncer ≥1.21 with
+   prepared-statement support) and avoid session-level advisory locks / `SET`. HikariCP stays
+   as the in-process pool pointed at PgBouncer. PgBouncer itself must be HA (run as a pooled
+   Deployment, or use the managed offering's built-in pooler).
+
+   **Pool sizing — explicit (CHAT-110 flag: no HikariCP overrides exist anywhere; everything is
+   on Spring Boot's default `maximum-pool-size=10`).** Left as-is that is a latent ceiling:
+   even without PgBouncer, `services × pods × 10` blows past a managed-Postgres backend limit
+   (~100–200) — e.g. chat-service alone at its floor of 3 pods = 30 backends, and each replica
+   read path adds more. The PgBouncer transaction-pooling tier is exactly what decouples app
+   pool size from backend count, so the guidance is:
+   - **Keep each service's HikariCP `maximum-pool-size` small and explicit — target ~10** (the
+     default is fine *behind* PgBouncer, but pin it rather than inherit it, and set a matching
+     `minimum-idle` and a sane `connection-timeout`). This is the count of *client* connections
+     a pod holds to PgBouncer, which are cheap.
+   - **PgBouncer `default_pool_size` (server-side, per database) is the real budget** — size it
+     so total server backends across all poolers stay within the Postgres `max_connections`
+     ceiling with headroom for admin/replication/failover (e.g. **~50–100 server connections
+     per cluster** against a 200-connection Postgres, leaving room). With transaction pooling,
+     a pool of ~50 server connections comfortably fronts hundreds of app-side client
+     connections at the ~1,400–1,800 req/sec target because connections are held only for the
+     duration of a transaction, not a request.
+   - **Action for developer:** add the explicit `spring.datasource.hikari.*` block per service
+     (currently absent) so the pool is a declared, reviewable number rather than a framework
+     default — tracked as its own ticket under the CHAT-24 epic.
+3. **Read replicas for the read-heavy paths.** GET history and profile reads dominate over
+   writes. Add streaming replica(s) per cluster and route `@Transactional(readOnly = true)`
+   traffic to them (a routing `DataSource` / read-write split). **Sized to CHAT-110:** the read
+   skew and volume differ per cluster, so — **chat cluster: primary + 2 replicas** (read-heavy:
+   GET-history dominates, and replicas also serve HA failover); **profile cluster: primary + 1
+   replica** (read-mostly but tiny ~1M rows — one replica covers both read offload and HA). Both
+   start here and scale replica count off observed read-IOPS, not a formula. **Caveat: replication lag** —
+   a sender must not fail to see their own just-posted message. Read-your-writes is already
+   satisfied by two existing properties: the sender's own real-time echo comes over the socket
+   (not a replica read), and the *most-recent* history page can be served from the primary
+   while *older* keyset pages (which are immutable) come from replicas. Wire the split with
+   that rule; it is not a new subsystem.
+
+**`messages` table partitioning — the first thing flagged, now decided (interval set by
+CHAT-110).** Convert `messages` to a **declaratively RANGE-partitioned table by `created_at`**.
+Rationale: message traffic is append-heavy and time-ordered, the hot working set is recent
+messages, the existing keyset index `(room_id, created_at DESC, id DESC)` is already
+time-aligned, and every history query is time-bounded via the cursor — so range-by-time gives
+partition pruning on reads, smaller per-partition indexes, and trivial archival/drop of cold
+partitions. Per-room locality is served by the composite index **within** each partition; we do
+**not** need HASH-by-`room_id` for that.
+
+**Interval = daily (changed from "monthly" after reconciliation).** performance-engineer's
+**~400 msg/sec sustained** works out to ~**35M rows/day, ~240M/week, ~1B/month**. The originally
+sketched *monthly* interval would therefore produce **~1-billion-row partitions**, whose indexes
+and vacuum/maintenance cost defeat the entire point of partitioning. **Daily partitions
+(~10–35M rows each) sit squarely in the healthy range.** Automate create/pre-provision/retention
+with **pg_partman** (daily granularity means hundreds of partitions/year — this must not be
+manual). Fall back to weekly only if observed sustained rate proves materially below the 400/sec
+target. Do this migration **early** (chat-service was just implemented and holds little data —
+converting a small table is a routine Flyway change; a huge one is not).
+
+**Beyond one primary (escalation, not built now).** If a single chat primary's *write*
+throughput becomes the ceiling even after partitioning, the next tier is **sharding `messages`
+across multiple chat Postgres clusters by `hash(room_id)`** (a room's history stays whole on
+one shard; the app routes by room). This is a genuinely larger change and is **deferred with a
+trigger** (write-IOPS on the chat primary as the observed ceiling), not designed here.
+
+### 3. Messaging backbone scaling — decided: broadcast-queue-per-instance + app-side filtering
+The recorded soft ceiling was **RabbitMQ queue/binding count** under the Sprint-1/CHAT-107
+STOMP-broker-relay topology, which creates a broker queue/binding **per subscription**: with
+millions of live room subscriptions that is millions of bindings — RabbitMQ's known failure
+mode. Decision for scale:
+
+**Why the obvious mitigations don't apply here.** You cannot partition ws-gateway by room
+(consistent-hash exchange, room→instance affinity, cellular-by-room): a single user holds **one
+socket** but subscribes to **many** rooms, so that user's pod must be able to receive events
+for *any* of their rooms. Given non-sticky, one-socket-per-user, **every ws-gateway pod must be
+able to receive any room's event.** That rules out room-sharding the delivery tier at this
+tier and points to a single answer.
+
+**Chosen topology (supersedes STOMP-relay-per-subscription):**
+- **Producers are unchanged.** chat-service still publishes `RoomMessageCreated` with routing
+  key `room.<roomId>` to the single durable topic exchange `chattera.events`, through the
+  `EventPublisher` abstraction. This is exactly the "contained, not a rewrite" payoff — the
+  write side does not move.
+- **One durable-definition, transient queue per ws-gateway pod**, bound to `chattera.events`
+  broadcast (`room.*` / `#`). Each pod consumes **all** room events and does **app-side
+  routing**: it keeps an in-memory `roomId → local socket sessions` map and forwards an event
+  only to the sockets it actually holds for that room, discarding the rest. This caps broker
+  **queue + binding count at O(ws-gateway pods)** — tens/hundreds, bounded — instead of
+  O(subscriptions). The binding-explosion ceiling is gone.
+- **Queues are transient/non-mirrored (cheap).** Because Postgres is the source of truth and a
+  dropped event is recovered by reconnect + history refetch, per-pod queues need no
+  durability/mirroring; only the **exchange** definition is durable. A broker node failure just
+  makes each pod redeclare its queue on a surviving node.
+- **The new ceiling, named honestly:** since every pod sees every message, per-pod
+  event-processing load equals the *total system publish rate* (**not** the post-fanout push
+  rate — fanout is applied locally per pod to its own sockets). Adding ws-gateway pods does
+  **not** reduce that consume load (it only adds socket capacity). That is a real ceiling — but
+  a far higher, more predictable one than millions of bindings, and it is a cheap hashmap-filter
+  per event.
+
+**Validated against CHAT-110 (flag 1).** The binding-count concern is **fully removed** by this
+topology, independent of room count: CHAT-110 computed ~**7,000 concurrently-active rooms**, but
+because bindings are per-*pod* (broadcast queue + `#` binding), not per-room/per-subscription,
+the broker binding count is **O(ws-gateway pods) ≈ tens** regardless of whether active rooms are
+7,000 or 700,000. The "thousands–tens of thousands active rooms safe zone" from the old Known-
+limits note is satisfied with enormous margin. On throughput: each pod's broadcast queue must
+consume the **publish** rate — **~400 events/sec sustained, ~2,000/sec burst** — which a single
+RabbitMQ consumer + in-memory hashmap filter handles trivially (that is one to two orders of
+magnitude below what a single AMQP consumer sustains). Note the ~1,200 sustained / 3,000–6,000
+burst *WS push* events/sec figure is the **post-fanout** number and is spread across all pods'
+local sockets; it does **not** land on any single pod's broadcast queue, so it does not move the
+per-pod-queue ceiling.
+
+**Kafka-escalation trigger — now a concrete number (was vague).** Adopt Kafka (per below) when
+the **sustained per-pod broadcast consume rate approaches ~10,000 events/sec** — roughly **5× the
+2,000/sec burst target / ~25× the 400/sec sustained target**, i.e. a 5×–25× growth in
+system-wide message publish rate beyond the 1M-user CHAT-110 targets. Below that, a single
+consumer's hashmap filter is not the bottleneck and RabbitMQ stays. This gives a monitored,
+alertable threshold (export per-pod broadcast-consume rate) rather than "evaluate later."
+
+**Design-time risk — unbounded room membership (CHAT-110 flag 2, recorded not mitigated).**
+CHAT-104 shipped with **no cap on room membership**, and every fanout number here assumes the
+CHAT-110 average room size of ~6–8. A single viral/uncapped room breaks that by orders of
+magnitude: one `RoomMessageCreated` for a 50,000-member room becomes a **50,000-way push burst**
+from a *single* consumed event. **Whether to cap membership is a product decision (business-
+analyst / PM), not the architect's to set** — but its impact on *this* design is on record:
+- **What the topology does well:** the broadcast-queue design already **distributes** mega-room
+  fanout the right way — each pod pushes only to the mega-room sockets it locally holds, so the
+  50k pushes are spread across the whole ws-gateway fleet rather than concentrated on one pod.
+  The broker/consume side is unaffected (still one event per message). So the failure is **not**
+  a broker or binding failure.
+- **Where it concretely gets worse and there is no guard today:** the per-pod **outbound** path
+  has **no backpressure or circuit-breaker**. A mega-room message spike can saturate a pod's
+  socket-write capacity and inflate p95 delivery latency past the 500 ms budget for *all* users
+  on that pod, not just the mega-room's. Today it simply degrades.
+- **Mitigation direction (cheap, enabled by persist-first — flag for a follow-up ticket, not
+  built in this pass):** give each socket a **bounded outbound queue**; on overflow, **drop the
+  push and mark the socket stale** rather than blocking the shared consumer — the client
+  recovers losslessly via the existing reconnect + history-refetch path (Postgres is source of
+  truth). That converts an unbounded-fanout meltdown into bounded, self-healing degradation. It
+  is the same property that makes drain/reconnect safe (§1), reused as backpressure. **Until a
+  membership cap and/or this bounded-queue guard exist, an uncapped mega-room is an accepted,
+  documented failure mode of this design, not a handled one.**
+
+**Broker HA:** RabbitMQ as a **3-node cluster, multi-AZ**. Any *durable* queue we add later
+uses **quorum queues**; the ws-gateway broadcast queues stay transient per above.
+
+**Kafka is now the named, conditional escalation (not a re-listing of options).** *If* total
+broadcast throughput exceeds what one ws-gateway pod can filter, the substrate — not just the
+tuning — has to change, and the chosen replacement is **Kafka**: independent consumer groups
+give exactly the "every pod receives everything" fan-out natively, a slow/restarting pod simply
+resumes from its offset (no lost-while-down), and partitions add producer/throughput
+parallelism. The `EventPublisher` abstraction keeps that producer swap contained. **Decision:
+stay on RabbitMQ with the broadcast-queue topology for this pass** (it removes the actual
+ceiling — binding count — while keeping the existing stack and DX); **adopt Kafka only on the
+per-pod-throughput trigger.** This is a real decision with a condition, not "evaluate later."
+
+### 4. Keycloak scaling
+Keycloak load is driven by **login/token-issuance/refresh rate**, not request rate — Chattera
+services validate tokens **locally** against cached JWKS and never call Keycloak per request, so
+Keycloak scaling is primarily an **availability** concern, secondarily throughput.
+- **3-node Keycloak cluster, multi-AZ**, behind `auth.chattera`. Keycloak 26 uses **Infinispan**
+  distributed caches for sessions/auth-codes; in k8s use JGroups **KUBE_PING/DNS_PING** discovery
+  so login-flow state (auth code, SSO session) is replicated — **no LB stickiness required**.
+- **Validated against CHAT-110 (flag 4): the ~180–200 token-refresh req/sec sustained peak is
+  comfortably absorbed.** A refresh grant is a signed-token + Infinispan session lookup; a single
+  Keycloak node sustains that order of load, and 3 nodes give headroom plus the AZ redundancy
+  that is the real reason for the count. No sizing change — but note the **direct lever:** refresh
+  rate is inversely proportional to access-token TTL (the realm's current **5-min** TTL is what
+  produces ~200/sec). If refresh load ever becomes the Keycloak ceiling, **raising the
+  access-token TTL** cuts it proportionally, traded against slower revocation propagation — a
+  config knob, not a topology change. Sized so refresh throughput is **not** the constraint here;
+  availability is.
+- **HA Postgres backend** for Keycloak (its own cluster, same primary+replica+failover story as
+  §2; already a separate DB today).
+- **Service-side resilience to Keycloak blips:** services cache JWKS and validate offline, so a
+  brief Keycloak outage does not stop request validation. Ensure services **re-fetch JWKS on an
+  unknown `kid`** so Keycloak signing-key rotation is transparent. This is existing resource-
+  server behavior to confirm, not new code.
+
+### 5. Redis scaling
+Redis holds `presence:{userId}` keys and the hot-conversation cache — all **single-key**
+operations (GET/SET/EXPIRE), no cross-user multi-key transactions, so the keyspace **shards
+cleanly**.
+- **HA now:** **managed Redis with automatic failover** (Cloud Memorystore / equivalent), or
+  self-run **Redis Sentinel** (primary + replicas + auto-failover), multi-AZ. Managed is
+  recommended for ops load.
+- **Scale-out when a single primary is the memory/throughput ceiling:** **Redis Cluster**
+  (hash-slot sharding) keyed by `userId`/`roomId`. The single-key access pattern means no
+  cross-slot operations — a clean fit.
+- **Separate presence from cache eviction policy.** Cache is LRU-evictable (`allkeys-lru`);
+  presence must **not** be arbitrarily evicted — it relies on TTL and heartbeat refresh. Keep
+  them in separate logical Redis (separate cluster or at least separate instance/policy).
+- **Failover is low-risk for presence:** a lost `presence:*` key is self-healing — ws-gateway
+  re-writes it on the next heartbeat/reconnect and every key carries a TTL. Cache loss just
+  repopulates from Postgres.
+
+### 6. High availability — no single point of failure (single region, multi-AZ)
+**SLO targets (CHAT-110):** **99.9% uptime** for this pass (99.95% is a flagged *stretch*, not a
+Sprint-1 commitment). Data durability: **RPO ≤ 5 s** — the Postgres primaries must run
+**synchronous or low-lag streaming replication** so an AZ-level primary loss loses ≤5 s of
+committed writes (this is the real durability guarantee; the transient broker/cache tiers are
+recovered by reconnect+refetch, not by RPO). **RTO ≤ 5 min** for AZ-level DB/broker failover —
+achievable with managed-HA/Patroni automatic promotion + PgBouncer reconnect; the per-component
+table below meets it. These bound the mechanisms, not the other way around: e.g. RPO ≤ 5 s is
+why replica lag on the *write* path matters and why the primary, not a lagging replica, serves
+read-your-writes (§2.3).
+
+
+| Component | HA mechanism | Failure behavior |
+|---|---|---|
+| gateway / profile / chat / file | k8s Deployment ≥2 pods, pod anti-affinity across ≥3 AZs, HPA | LB health-check drops dead pods; k8s reschedules |
+| ws-gateway | Deployment ≥2 pods multi-AZ; non-sticky reconnect | client reconnects to any surviving pod, refetches history — lossless |
+| Load balancers | managed cloud L7 LBs | inherently multi-AZ, no action |
+| PostgreSQL (per service) | primary + replica(s) multi-AZ, automatic failover (managed HA / Patroni) | promote replica; PgBouncer reconnects |
+| PgBouncer | pooled Deployment / managed pooler | multiple instances, no single pooler |
+| RabbitMQ | 3-node cluster multi-AZ; quorum queues for durable, transient per-pod queues redeclared on survivor | pod redeclares its broadcast queue on a live node |
+| Keycloak | 3 nodes, replicated Infinispan, multi-AZ, HA DB | any node serves; sessions replicated |
+| Redis | managed HA / Sentinel / Cluster + replicas, multi-AZ | auto-failover; presence self-heals via TTL+heartbeat |
+| Object storage | cloud object storage (GCS/S3), inherently multi-AZ durable | MinIO is **dev-only**; prod swaps to the managed store |
+
+### 7. What holds unchanged vs. what needs rework
+**Holds unchanged at scale (Sprint 1 deliberately built for this — the "contained, not a
+rewrite" thesis proven out):**
+- **Stateless services + local JWT/JWKS validation** → horizontal scale is "add pods," with
+  **no** session store to introduce. The single biggest win.
+- **Postgres as source of truth / bus as transient delivery** → lets ws-gateway queues be
+  transient, enables replica reads, and makes reconnect-and-refetch lossless.
+- **`EventPublisher` abstraction** → producers don't change when the consumer topology changes
+  (§3) or if Kafka is later adopted.
+- **JWT `azp` validation pattern** → per-instance, offline, scales freely.
+- **Non-sticky ws-gateway reconnect + history refetch** → the property that makes the delivery
+  edge horizontally scalable and drain-safe.
+- **Schema-per-service boundary** → clean boundary is exactly what makes the instance-per-
+  service DB split (§2) a config change.
+- **Keyset pagination on the composite index** → correct and cheap per-partition, unchanged.
+- **MinIO presigned-URL pattern (file bytes bypass the app tier)** → unchanged; only the
+  backing store swaps MinIO→cloud object storage.
+
+**Needs rework / net-new:**
+- **ws-gateway consumer topology:** STOMP-relay-per-subscription → **broadcast queue per pod +
+  app-side room→session filtering** (§3). Contained to ws-gateway consumer wiring (CHAT-107).
+- **PostgreSQL:** single instance → **instance-per-service + PgBouncer + read replicas +
+  RANGE-partitioned `messages`** (§2).
+- **RabbitMQ / Redis / Keycloak:** single instance → **clustered/HA** (§3/§5/§4).
+- **Net-new platform:** managed **load balancers**, **Kubernetes** orchestration, **HPA/KEDA**,
+  **liveness/readiness probes + graceful shutdown**, autoscaling metrics/exporters, and the
+  MinIO→cloud-object-storage swap. None of these exist today.
+
+### 8. Explicitly still deferred (with triggers)
+- **Multi-region / active-active / DR.** Out of scope for this pass; target is single-region
+  multi-AZ HA. Multi-region adds cross-region Postgres replication, Keycloak cross-site
+  Infinispan, Redis/RabbitMQ federation, object-storage geo-replication, and a global/DNS LB —
+  a separate epic. Trigger: a latency-for-distant-users or regional-DR requirement from
+  product.
+- **ws-gateway cellular sharding by room.** Only relevant if the per-pod broadcast-throughput
+  ceiling (§3) is hit *and* Kafka doesn't buy enough headroom. Genuinely complex (a user spans
+  rooms across cells). Deferred with the throughput trigger.
+- **Sharding `messages` across multiple chat DB clusters by `hash(room_id)`** (§2). Deferred
+  with the chat-primary write-IOPS trigger.
+- ~~**Exact capacity numbers** (replica counts, per-pod socket ceiling, partition interval, HPA
+  thresholds, node counts).~~ **Landed and reconciled** against performance-engineer's CHAT-110
+  targets (2026-07-27) — folded into §§1–5 as concrete values (per-pod socket ceiling ~20k;
+  HPA CPU ~65% / ws-conn ~70%; chat +2 / profile +1 replicas; daily `messages` partitions;
+  Hikari ~10 behind PgBouncer ~50–100 server conns; Kafka trigger ~10k events/sec/pod). No
+  longer deferred. Remaining true unknowns are **load-test-confirmed** ceilings (validate the
+  ~20k socket and ~10k-event/sec figures under soak), not undesigned decisions.
+
+### 9. Delivery / handoffs
+This is buildable now. Suggested breakdown for scrum-master to ticket under the CHAT-24 epic
+(sequence roughly: platform first, then per-component HA, then the topology change):
+- **devops-engineer:** Kubernetes cluster + IaC; the three L7 LBs (REST/WS/auth) with WS-upgrade
+  + draining on `ws.chattera`; managed HA PostgreSQL (per service) + PgBouncer; RabbitMQ 3-node
+  cluster; managed HA Redis; Keycloak 3-node Infinispan cluster; MinIO→cloud object storage;
+  probe/metric scrape wiring. Depends on CHAT-108 (pipeline) landing first.
+- **developer:** liveness/readiness health groups + `server.shutdown=graceful` per service;
+  read/write `DataSource` split with the read-your-writes rule (§2.3); Hibernate
+  prepared-statement setting for PgBouncer transaction mode (§2.2); **explicit
+  `spring.datasource.hikari.*` pool block per service (~10) replacing the inherited default
+  (§2.2, CHAT-110 flag 3)**; `messages` **daily** RANGE-partition Flyway migration + pg_partman
+  (§2, do early); ws-gateway broadcast-queue consumer + in-memory room→session router replacing
+  the STOMP-relay-per-subscription wiring (§3, CHAT-107 area); ws-gateway active-connection-count
+  and per-pod broadcast-consume-rate metrics for HPA + the Kafka trigger; **bounded per-socket
+  outbound queue with drop-and-mark-stale backpressure (§3 mega-room risk, CHAT-110 flag 2) —
+  follow-up ticket.**
+- **performance-engineer:** the concurrency/throughput/latency/availability targets that turn
+  every "tunable" above into a number; load-test the per-pod socket and broadcast-throughput
+  ceilings that gate §1 and the RabbitMQ→Kafka trigger in §3.
+- **Reconcile:** ~~when performance-engineer's numbers land, revisit HPA thresholds, replica
+  counts, partition interval, and the §3 Kafka trigger.~~ **Done 2026-07-27** against CHAT-110 —
+  see the "Reconciled against performance-engineer's CHAT-110 targets" callout at the top of this
+  section. One decision changed (partition interval monthly→daily); all other numbers filled as
+  tunables; two risks recorded (unbounded room membership §3, default Hikari pool §2.2). Next
+  reconciliation trigger: load-test results confirming/adjusting the ~20k socket and ~10k
+  event/sec/pod ceilings.
