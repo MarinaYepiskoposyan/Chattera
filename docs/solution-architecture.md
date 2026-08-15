@@ -55,8 +55,12 @@ Decided this session (do not re-litigate; these are the working baseline):
   below). chat-service is the first producer onto the backbone; the `EventPublisher`
   abstraction in `platform/common-messaging` gets its first concrete transport here.
   Rationale and the options weighed are documented in the CHAT-104 section. WebSocket
-  delivery (ws-gateway) uses Spring WebSocket + STOMP with RabbitMQ's STOMP broker relay so
-  cross-instance fanout is handled by the broker rather than in app code (wired in CHAT-107).
+  delivery (ws-gateway) uses Spring WebSocket + STOMP with an **in-memory simple broker per
+  pod** fed by a **single broadcast queue per pod** on `chattera.events` (CHAT-24 §3 topology;
+  wired in CHAT-107). The earlier "RabbitMQ STOMP broker relay per subscription" note is
+  **superseded** — that model created a broker queue/binding per subscription and was rejected
+  in CHAT-24 §3. See the "Real-time delivery — CHAT-107 implementation decisions" subsection
+  below for exact destinations, receipt flow, and subscribe-time authz.
 
 Proposed, pending Sprint 1 refinement with developer/qa-engineer:
 - Data access: Spring Data JPA/Hibernate for CRUD velocity in Sprint 1; the message
@@ -243,7 +247,9 @@ CHAT-105) a single per-message status is sufficient. **Per-recipient read receip
 multi-participant rooms ("read by whom?") are a genuinely larger, fan-out N:M concern** —
 that needs a separate `message_receipts(message_id, user_id, status)` table and is flagged
 to CHAT-107, likely limited to DMs for Sprint 1. Do not build room-level per-recipient
-receipts in CHAT-104.
+receipts in CHAT-104. The concrete DELIVERED/READ write-back mechanism (broker-mediated
+receipt events, triggers, persistence rule) is specified in "Real-time delivery — CHAT-107
+implementation decisions" §2 below.
 
 ### Data model (chat-service schema, Flyway)
 **A direct message is a specialization of a room, not a separate concept.** DMs (CHAT-105)
@@ -388,6 +394,159 @@ unbounded "return everything" fetch.
   a trivial increment on the mandatory cap and avoids a certain near-term rework ("load
   older messages" is core chat UX). Heavier history features (full-text search,
   jump-to-date, unread-anchored loading) remain deferred.
+
+### Real-time delivery — CHAT-107 implementation decisions (STOMP destinations, receipts, subscribe authz)
+Pins down the three implementation-level decisions CHAT-107 needs before build. The
+big-picture runtime is already settled above ("Real-time delivery runtime & the ws-gateway ↔
+chat-service relationship") and in CHAT-24 §3 ("broadcast queue per ws-gateway pod +
+app-side room→session filtering"); this subsection does **not** re-derive it, it fills in the
+concrete strings, event shapes, and trigger conditions so developer can implement directly.
+
+**Broker wiring recap (the constraint every decision below respects).** ws-gateway uses
+Spring's **in-memory simple broker** (`enableSimpleBroker("/topic")`, **not**
+`enableStompBrokerRelay` — the relay-per-subscription model is the rejected one). Each pod
+runs one RabbitMQ consumer on **its own broadcast queue** bound to exchange `chattera.events`
+with routing pattern **`room.#`**, so the pod receives *every* room event. The consumer
+republishes each event into the local simple broker via `SimpMessagingTemplate`; the simple
+broker's per-pod subscription registry **is** the "in-memory roomId→local-session map" from
+CHAT-24 §3 — developer does not hand-roll that map, Spring maintains it. ws-gateway never
+touches Postgres and never calls chat-service on the message hot path.
+
+#### 1. STOMP destination naming
+- **Room and DM conversation stream — clients SUBSCRIBE to `/topic/rooms.{roomId}`.** This is
+  the single delivery destination for *both* room messages and DMs. A DM is a room
+  (`type='DIRECT'`, CHAT-105), so it reuses the exact same destination, event, routing key,
+  and authz as any other room — there is **no** separate per-user `/user/queue/...` delivery
+  destination for messages. `{roomId}` is the concrete room UUID; the substituted destination
+  (e.g. `/topic/rooms.7f3e...`) is an opaque exact-match string to the simple broker, so **no
+  custom `PathMatcher` is required** for subscribe/deliver.
+- **What the client subscribes to.** On CONNECT the client fetches its room list over REST and
+  SUBSCRIBEs to `/topic/rooms.{roomId}` for each room/DM it belongs to and wants live. Opening
+  a new conversation adds one SUBSCRIBE.
+- **Consistency with the broadcast-queue topology.** The client-facing destination is a
+  simple-broker concept and is **decoupled** from the AMQP layer: the RabbitMQ side is a
+  single per-pod broadcast queue with a **catch-all `room.#` binding**, not a
+  binding-per-destination. Naming rooms `/topic/rooms.{roomId}` therefore does not create any
+  per-room broker binding — it only creates a per-session entry in the pod's in-memory simple
+  broker registry. This is exactly what keeps broker binding count at O(pods), per CHAT-24 §3.
+- **Not-currently-subscribed conversations** (e.g. a brand-new DM opened by someone else after
+  you connected) are picked up on the next room-list/history refetch, not pushed live. A
+  dedicated real-time "new-conversation" nudge (FR-05 in-app notifications) is its **own**
+  concern and is **deferred** to the notifications ticket — it is explicitly out of CHAT-107
+  scope so ws-gateway stays free of room-membership knowledge.
+
+#### 2. Delivered/read status write-back — broker-mediated (option a), never a direct call
+ws-gateway must never write Postgres and never call chat-service synchronously on the hot
+path. So status write-back is **broker-mediated in both directions** (mirrors the
+persist-then-publish producer side): ws-gateway **publishes** a receipt event onto
+`chattera.events`; **chat-service consumes it and applies the Postgres update**. ws-gateway
+gets the `EventPublisher` from `common-messaging` exactly as chat-service does (publish is
+best-effort/never-throws per that contract).
+
+**New shared events (add to `common-domain`, records implementing `DomainEvent`, mirroring
+`RoomMessageCreatedEvent`):**
+
+```
+// Published by ws-gateway, consumed by chat-service. Routing key: receipt.delivered
+MessageDeliveredEvent(UUID messageId, UUID roomId, String recipientId,
+                      Instant deliveredAt, Instant occurredAt)
+
+// Published by ws-gateway, consumed by chat-service. Routing key: receipt.read
+// messageId = the recipient's last-read message; chat-service applies "read up to" semantics.
+MessageReadEvent(UUID messageId, UUID roomId, String recipientId,
+                 Instant readAt, Instant occurredAt)
+
+// Published by chat-service AFTER it persists a status change, consumed by ws-gateway.
+// Routing key: room.<roomId>  (same key family as messages, so it rides the same per-pod
+// broadcast queue and is delivered on /topic/rooms.{roomId} like any room event).
+// status is "DELIVERED" | "READ" (kept a String to avoid depending on chat-service's
+// MessageStatus enum from a shared module; documented allowed values).
+RoomMessageStatusChangedEvent(UUID messageId, UUID roomId, String status,
+                              String recipientId, Instant occurredAt)
+```
+
+**Routing keys / queues:**
+- ws-gateway publishes receipts with keys `receipt.delivered` / `receipt.read`.
+- **chat-service** adds a durable `@RabbitListener` queue (e.g. `chat.receipts`) bound to
+  `chattera.events` with pattern **`receipt.*`**. ws-gateway's broadcast queue binds `room.#`
+  (above) and therefore does **not** consume `receipt.*` — receipts are chat-service-only.
+- After chat-service persists, it publishes `RoomMessageStatusChangedEvent` with key
+  `room.<roomId>`, which ws-gateway pods pick up on their `room.#` broadcast queue and deliver
+  on `/topic/rooms.{roomId}` — so the **original sender** (subscribed to that topic) sees the
+  tick update live. This one extra hop applies only to low-volume, DM-only receipts, never to
+  the message hot path.
+
+**Persistence rule (monotonic, idempotent).** chat-service advances status only, never
+downgrades, so out-of-order or duplicate receipts are safe:
+- On `MessageDeliveredEvent`:
+  `UPDATE messages SET status='DELIVERED' WHERE id=:messageId AND status='SENT'`.
+- On `MessageReadEvent` (read-up-to, resolved server-side since chat-service owns `messages`):
+  `UPDATE messages SET status='READ' WHERE room_id=:roomId AND sender_id<>:recipientId
+   AND status<>'READ' AND created_at <= (SELECT created_at FROM messages WHERE id=:messageId)`.
+- Publish `RoomMessageStatusChangedEvent` **only if a row was actually advanced** (avoid
+  echoing no-op receipts). For READ, publish one event carrying the last-read `messageId`; the
+  client applies up-to semantics (mark all messages `<= messageId` read). For DELIVERED,
+  publish for that single `messageId`.
+- Sprint 1 is **DMs only** for receipts (single recipient → the single `messages.status`
+  column is sufficient). Per-recipient room read receipts still need the deferred
+  `message_receipts(message_id, user_id, status)` table (CHAT-104 §"Message status") and are
+  **not** built here.
+
+**What triggers DELIVERED vs READ:**
+- **DELIVERED = server-side, automatic, no client action.** When a ws-gateway pod
+  **successfully pushes** a `RoomMessageCreatedEvent` to a locally-held socket whose
+  `userId != senderId` (i.e. an actual recipient, not the sender's own echo), the pod emits
+  `MessageDeliveredEvent(messageId, roomId, recipientId=thatUser, ...)`. This is the
+  "message reached a currently-connected socket" trigger; the recipient client does nothing.
+- **READ = client-signalled**, because "rendered in the recipient's open/focused conversation
+  view" is knowledge only the client has. The client sends a **STOMP `SEND`** frame to the
+  application destination **`/app/message.read`** (static destination — roomId travels in the
+  body, so no `@MessageMapping` template var / dot-`PathMatcher` config is needed) with body:
+  ```
+  { "roomId": "<uuid>", "lastReadMessageId": "<uuid>" }
+  ```
+  ws-gateway's `@MessageMapping("/message.read")` handler resolves the authenticated
+  `recipientId` from the STOMP session principal (never the body), **verifies the sender is a
+  member of `roomId`** (same check as §3, cached), and publishes
+  `MessageReadEvent(lastReadMessageId, roomId, recipientId, now, now)` with key `receipt.read`.
+  No REST call, no DB access on the socket path.
+
+#### 3. Subscribe-time authorization — one-time internal membership check (option a)
+A client may only SUBSCRIBE to `/topic/rooms.{roomId}` for a room it is a member of (same rule
+REST enforces for post/read). ws-gateway does **not** own or query the `room_members` table.
+It enforces membership with a **one-time internal REST call to chat-service at SUBSCRIBE time**
+(and on the `/app/message.read` SEND) — **not** per message, so the coupling is limited to
+infrequent subscribe/read events, not the delivery hot path.
+
+- **Mechanism.** A Spring `ChannelInterceptor` on ws-gateway's **inbound** channel intercepts
+  `StompCommand.SUBSCRIBE` frames whose destination matches `/topic/rooms.{roomId}`, extracts
+  `roomId`, and calls chat-service before the subscription is admitted to the simple broker.
+  On 200 → allow; on anything else → reject the frame with a STOMP `ERROR` (client shows "no
+  access" / retries after refresh).
+- **Endpoint (new, cheap — add to chat-service under CHAT-107).**
+  `GET /rooms/{roomId}/members/me` →
+  - `200` `{ "roomId": "...", "userId": "...", "role": "OWNER"|"MEMBER" }` if the caller is a
+    member;
+  - `404` if the caller is not a member **or** the room does not exist (same response, to avoid
+    room-existence enumeration);
+  - `401` if the token is invalid/expired.
+  It reuses chat-service's existing `RoomAccessService.requireMembership` logic that already
+  backs POST/GET, and is deliberately lighter than CHAT-34's `GET /rooms/{roomId}/members`
+  (no member-list fanout — this is a boolean-shaped self-check).
+- **Auth on the internal call.** ws-gateway forwards the **user's own access token** (captured
+  at CONNECT) as `Authorization: Bearer <token>` on the call; chat-service validates it as a
+  normal resource-server request and derives the membership subject from the token `sub`. No
+  service account / confidential client is introduced (consistent with the Sprint-1 "no
+  confidential client" decision). If the captured token has expired, the call returns 401 and
+  ws-gateway rejects the SUBSCRIBE; the client reconnects with a fresh token. (Refreshing the
+  token over a live socket is a post-Sprint-1 hardening, noted, not built here.)
+- **Caching (bounded staleness).** ws-gateway caches a positive `(userId, roomId)` result
+  in-memory for the socket session with a short TTL (~60 s) to avoid re-hitting chat-service on
+  reconnect/re-SUBSCRIBE storms and on each `/app/message.read`. A user who *left* a room
+  keeps delivery for at most the TTL, which is low-risk (they refetch/reconnect and stop
+  seeing it); membership grants are the common case and rarely revoked mid-session.
+- **`/app/message.read` reuses the same check** before publishing a `MessageReadEvent`, so a
+  non-member cannot forge read receipts.
 
 ## Sprint 1 Architecture Focus
 - define API contracts
