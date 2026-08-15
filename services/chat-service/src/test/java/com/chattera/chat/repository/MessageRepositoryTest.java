@@ -70,4 +70,26 @@ class MessageRepositoryTest {
 
         assertThat(roomAHistory).extracting(Message::getContent).containsExactly("in-a");
     }
+
+    @Test
+    void markReadUpToIgnoresALastReadMessageIdThatBelongsToADifferentRoom() {
+        // CHAT-38 regression: a lastReadMessageId from room B must not be
+        // usable to resolve a read cutoff timestamp applied to room A.
+        UUID roomA = roomRepository.save(new Room(UUID.randomUUID(), "room-a", RoomType.PUBLIC, "owner", Instant.now())).getId();
+        UUID roomB = roomRepository.save(new Room(UUID.randomUUID(), "room-b", RoomType.PUBLIC, "owner", Instant.now())).getId();
+        Instant base = Instant.parse("2026-01-01T00:00:00Z");
+
+        Message messageInRoomA = messageRepository.save(
+                new Message(UUID.randomUUID(), roomA, "other-user", "in-a", MessageStatus.SENT, base));
+        // A far-future message in room B: if the room check were missing, its
+        // late createdAt would resolve as a cutoff that covers messageInRoomA.
+        Message messageInRoomB = messageRepository.save(
+                new Message(UUID.randomUUID(), roomB, "other-user", "in-b", MessageStatus.SENT, base.plusSeconds(3600)));
+
+        int updated = messageRepository.markReadUpTo(roomA, "recipient", messageInRoomB.getId());
+
+        assertThat(updated).isZero();
+        Message reloaded = messageRepository.findById(messageInRoomA.getId()).orElseThrow();
+        assertThat(reloaded.getStatus()).isEqualTo(MessageStatus.SENT);
+    }
 }

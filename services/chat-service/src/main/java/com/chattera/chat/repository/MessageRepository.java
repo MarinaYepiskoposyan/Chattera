@@ -57,8 +57,11 @@ public interface MessageRepository extends JpaRepository<Message, UUID> {
      * solution-architecture.md "Message status") so {@code recipientId} is
      * unambiguous - a room's non-recipient-sent messages all belong to the
      * single other DM participant. Idempotent by construction (status &lt;&gt;
-     * READ guard); if {@code lastReadMessageId} doesn't resolve to a row, the
-     * subquery yields no comparable timestamp and zero rows are updated.
+     * READ guard); if {@code lastReadMessageId} doesn't resolve to a row
+     * (missing, or - CHAT-38 - belonging to a different room than
+     * {@code roomId}), the subquery yields no comparable timestamp and zero
+     * rows are updated, rather than resolving a cutoff from an unrelated
+     * room's message.
      */
     @Modifying
     @Query("""
@@ -66,7 +69,8 @@ public interface MessageRepository extends JpaRepository<Message, UUID> {
             WHERE m.roomId = :roomId
               AND m.senderId <> :recipientId
               AND m.status <> com.chattera.chat.domain.MessageStatus.READ
-              AND m.createdAt <= (SELECT last.createdAt FROM Message last WHERE last.id = :lastReadMessageId)
+              AND m.createdAt <= (SELECT last.createdAt FROM Message last
+                                   WHERE last.id = :lastReadMessageId AND last.roomId = :roomId)
             """)
     int markReadUpTo(
             @Param("roomId") UUID roomId,
