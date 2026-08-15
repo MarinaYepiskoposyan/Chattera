@@ -707,6 +707,13 @@ button {
   color: var(--color-text);
 }
 
+/* Delivered/read status (CHAT-107) - shown only on your own messages. */
+.message-status {
+  margin-left: 0.35rem;
+  font-size: 0.72rem;
+  color: var(--color-text-dim);
+}
+
 .message-bubble {
   border-radius: 14px;
   padding: 0.5rem 0.8rem;

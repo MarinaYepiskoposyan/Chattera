@@ -12,9 +12,12 @@ for the real Chattera web client.
 
 - The local infra stack up: `docker compose up -d` from the repo root
   (Postgres, Redis, Keycloak, RabbitMQ — see `infra/README.md`).
-- `profile-service` running on port 8082 and `chat-service` running on port
-  8083 (`mvn spring-boot:run` from each service directory — see the root
-  `CLAUDE.md` "Build/test" section).
+- `profile-service` (port 8082), `chat-service` (port 8083), and `ws-gateway`
+  (port 8081) all running (`mvn spring-boot:run` from each service directory
+  — see the root `CLAUDE.md` "Build/test" section). `ws-gateway` is only
+  needed for the live message/status updates described below; the rest of
+  the console works without it (messages just won't appear until the next
+  manual refresh).
 
 ## Running it
 
@@ -58,16 +61,29 @@ Then open http://localhost:3000 in a browser.
    lets you create one (`POST /rooms`), and join/leave (`POST
    /rooms/{id}/join` / `/leave`). Click a room's name to open it and see/post
    messages (`GET`/`POST /rooms/{roomId}/messages`).
-5. Errors (4xx/5xx from either service) are shown inline, including the raw
-   `code`/`message` from the API — that's intentional for a dev tool.
-6. **Log out** just clears the local token; it does not end the Keycloak SSO
-   session server-side.
+5. **Real-time delivery (CHAT-107)**: opening a room connects to ws-gateway
+   over STOMP-over-WebSocket (via the `@stomp/stompjs` CDN bundle - see
+   `index.html`) using the same access token, and SUBSCRIBEs to
+   `/topic/rooms.{roomId}`. New messages posted by anyone (including from a
+   second browser session/tab logged in as a different user) appear live,
+   with no manual refresh. Your own messages show a small "Sent" / "Delivered"
+   / "Read" label that updates live as those receipts arrive; opening a room
+   or receiving a message from someone else automatically sends a read
+   receipt for the latest message (a simple demonstration, not real
+   scroll/focus-based read tracking).
+6. Errors (4xx/5xx from either service, or a STOMP connection/authorization
+   error) are shown inline, including the raw `code`/`message` from the API
+   — that's intentional for a dev tool.
+7. **Log out** just clears the local token and disconnects the WebSocket; it
+   does not end the Keycloak SSO session server-side.
 
 ## Notes / limitations
 
 - No token refresh: the Keycloak `chattera` realm's access tokens are
   short-lived (5 minutes). When one expires, the next API call gets a 401
-  and the console drops back to "logged out" — just log in again.
+  and the console drops back to "logged out" — just log in again. The
+  WebSocket connection is similarly not refreshed mid-session (see
+  solution-architecture.md's noted post-Sprint-1 hardening).
 - No pagination UI for message history (always shows the first/most recent
   page returned by `GET /rooms/{roomId}/messages`).
 - No file upload/download UI (file-service is a scaffold only — see root

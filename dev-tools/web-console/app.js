@@ -118,6 +118,7 @@ async function handleCallbackIfPresent() {
 
 function logout() {
   clearTokens();
+  disconnectStomp();
   render();
 }
 
@@ -142,6 +143,7 @@ async function apiFetch(url, options = {}) {
   if (!response.ok) {
     if (response.status === 401) {
       clearTokens();
+      disconnectStomp();
       render();
     }
     const detail = parsed ? (parsed.message || JSON.stringify(parsed)) : response.statusText;
@@ -350,6 +352,11 @@ async function openRoom(room) {
     li.classList.toggle("active", li.dataset.roomId === String(room.id));
   });
   await Promise.all([loadMessages(), loadMembers()]);
+  if (stompClient && stompClient.connected) {
+    subscribeToRoomTopic(room.id);
+  } else {
+    connectStomp();
+  }
 }
 
 async function loadMessages() {
@@ -378,35 +385,168 @@ function formatTimestamp(value) {
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
 }
 
+// messageId -> the <li> row, so live status-change events (CHAT-107) can
+// update an already-rendered bubble in place instead of a full re-render.
+const messageRowsByMessageId = new Map();
+
+function buildMessageRow(message) {
+  const currentUserId = getCurrentUserId();
+  const isOwn = currentUserId != null && message.senderId === currentUserId;
+
+  const row = document.createElement("li");
+  row.className = `message-row ${isOwn ? "own" : "other"}`;
+  row.dataset.messageId = String(message.id);
+
+  const meta = document.createElement("div");
+  meta.className = "message-meta";
+  const sender = document.createElement("span");
+  sender.className = "sender";
+  sender.textContent = isOwn ? "You" : message.senderId;
+  meta.appendChild(sender);
+  meta.appendChild(document.createTextNode(` · ${formatTimestamp(message.createdAt)}`));
+
+  const bubble = document.createElement("div");
+  bubble.className = "message-bubble";
+  bubble.textContent = message.content;
+
+  row.appendChild(meta);
+  row.appendChild(bubble);
+
+  // Delivered/read status is only meaningful to show on your own messages -
+  // a nice-to-have visual per CHAT-107, not required.
+  if (isOwn) {
+    const status = document.createElement("span");
+    status.className = "message-status";
+    status.textContent = statusLabel(message.status);
+    meta.appendChild(status);
+  }
+
+  return row;
+}
+
+function statusLabel(status) {
+  if (status === "READ") return "Read";
+  if (status === "DELIVERED") return "Delivered";
+  return "Sent";
+}
+
 function renderMessages(messages) {
   const list = document.getElementById("message-list");
   list.innerHTML = "";
-  const currentUserId = getCurrentUserId();
+  messageRowsByMessageId.clear();
   // API returns newest-first; show oldest-first like a normal chat transcript.
   const ordered = [...messages].reverse();
   for (const message of ordered) {
-    const isOwn = currentUserId != null && message.senderId === currentUserId;
-
-    const row = document.createElement("li");
-    row.className = `message-row ${isOwn ? "own" : "other"}`;
-
-    const meta = document.createElement("div");
-    meta.className = "message-meta";
-    const sender = document.createElement("span");
-    sender.className = "sender";
-    sender.textContent = isOwn ? "You" : message.senderId;
-    meta.appendChild(sender);
-    meta.appendChild(document.createTextNode(` · ${formatTimestamp(message.createdAt)}`));
-
-    const bubble = document.createElement("div");
-    bubble.className = "message-bubble";
-    bubble.textContent = message.content;
-
-    row.appendChild(meta);
-    row.appendChild(bubble);
+    const row = buildMessageRow(message);
+    messageRowsByMessageId.set(String(message.id), row);
     list.appendChild(row);
   }
   list.scrollTop = list.scrollHeight;
+  maybeSendReadReceipt(ordered[ordered.length - 1]);
+}
+
+// ---------------------------------------------------------------------------
+// Real-time delivery (CHAT-107) - STOMP over WebSocket via ws-gateway
+// ---------------------------------------------------------------------------
+
+let stompClient = null;
+let currentRoomSubscription = null;
+
+// Connects once per login session; reused across room switches (only the
+// topic subscription changes, per solution-architecture.md - clients
+// SUBSCRIBE to /topic/rooms.{roomId} for each conversation they open).
+function connectStomp() {
+  const tokens = getTokens();
+  if (!tokens || !tokens.access_token || stompClient) return;
+
+  stompClient = new StompJs.Client({
+    brokerURL: CONFIG.wsGatewayUrl,
+    connectHeaders: { Authorization: `Bearer ${tokens.access_token}` },
+    reconnectDelay: 5000,
+    onConnect: () => {
+      if (selectedRoom) subscribeToRoomTopic(selectedRoom.id);
+    },
+    onStompError: (frame) => {
+      showError("messages-error", new Error(frame.headers?.message || "Real-time connection error"));
+    },
+  });
+  stompClient.activate();
+}
+
+function disconnectStomp() {
+  if (stompClient) {
+    stompClient.deactivate();
+  }
+  stompClient = null;
+  currentRoomSubscription = null;
+  messageRowsByMessageId.clear();
+}
+
+function subscribeToRoomTopic(roomId) {
+  if (!stompClient || !stompClient.connected) return;
+  if (currentRoomSubscription) {
+    currentRoomSubscription.unsubscribe();
+  }
+  currentRoomSubscription = stompClient.subscribe(`/topic/rooms.${roomId}`, (frame) => {
+    handleIncomingRoomEvent(JSON.parse(frame.body));
+  });
+}
+
+// A room's topic carries two event shapes - a new message (has `content`)
+// or a delivered/read status change (has `status`) - see
+// solution-architecture.md "Real-time delivery - CHAT-107 implementation
+// decisions".
+function handleIncomingRoomEvent(event) {
+  if (!selectedRoom || String(event.roomId) !== String(selectedRoom.id)) return;
+  if (event.content !== undefined) {
+    appendLiveMessage(event);
+  } else if (event.status !== undefined) {
+    updateMessageStatusBadge(event.messageId, event.status);
+  }
+}
+
+function appendLiveMessage(event) {
+  // The sender also SUBSCRIBEs to the room it just posted to (so it can see
+  // live status ticks on its own messages), so it receives its own message
+  // back as a live echo in addition to the manual reload the post-message
+  // form already does. Guard against rendering the same messageId twice
+  // regardless of which path (reload vs. live push) wins the race.
+  if (messageRowsByMessageId.has(String(event.messageId))) return;
+
+  const list = document.getElementById("message-list");
+  const message = {
+    id: event.messageId,
+    senderId: event.senderId,
+    content: event.content,
+    createdAt: event.createdAt,
+    status: "SENT",
+  };
+  const row = buildMessageRow(message);
+  messageRowsByMessageId.set(String(message.id), row);
+  list.appendChild(row);
+  list.scrollTop = list.scrollHeight;
+  maybeSendReadReceipt(message);
+}
+
+function updateMessageStatusBadge(messageId, status) {
+  const row = messageRowsByMessageId.get(String(messageId));
+  if (!row) return;
+  const statusEl = row.querySelector(".message-status");
+  if (statusEl) statusEl.textContent = statusLabel(status);
+}
+
+// Nice-to-have demonstration of the read side of CHAT-107: if the most
+// recent message in the open room wasn't sent by us, tell ws-gateway we've
+// "read" up to it. Real read-tracking (scroll/focus based) is out of scope
+// for this throwaway dev tool.
+function maybeSendReadReceipt(lastMessage) {
+  if (!lastMessage || !selectedRoom || !stompClient || !stompClient.connected) return;
+  const currentUserId = getCurrentUserId();
+  if (!currentUserId || lastMessage.senderId === currentUserId) return;
+  stompClient.publish({
+    destination: "/app/message.read",
+    body: JSON.stringify({ roomId: selectedRoom.id, lastReadMessageId: lastMessage.id }),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +648,7 @@ function render() {
     app.style.display = "flex";
     loadProfile();
     loadRooms();
+    connectStomp();
   } else {
     status.textContent = "";
     loginBtn.style.display = "inline-block";

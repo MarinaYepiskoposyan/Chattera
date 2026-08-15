@@ -97,4 +97,38 @@ class RoomMemberControllerTest {
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.code").value("ROOM_NOT_FOUND"));
     }
+
+    @Test
+    void getSelfMembershipIsRejectedWithoutAToken() throws Exception {
+        UUID roomId = UUID.randomUUID();
+        mockMvc.perform(get("/rooms/" + roomId + "/members/me"))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void getSelfMembershipReturns200WithRoleForAMember() throws Exception {
+        UUID roomId = UUID.randomUUID();
+        RoomMember member = new RoomMember(roomId, "user-1", RoomRole.OWNER, Instant.parse("2026-01-01T00:00:00Z"));
+        when(roomMemberService.getSelfMembership(eq("user-1"), eq(roomId))).thenReturn(member);
+
+        mockMvc.perform(get("/rooms/" + roomId + "/members/me").with(jwt().jwt(builder -> builder.subject("user-1"))))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.roomId").value(roomId.toString()))
+                .andExpect(jsonPath("$.userId").value("user-1"))
+                .andExpect(jsonPath("$.role").value("OWNER"));
+    }
+
+    /**
+     * Anti-enumeration: a non-member gets the same 404 as an unknown room,
+     * never a 403 - see RoomAccessService.requireSelfMembership.
+     */
+    @Test
+    void getSelfMembershipOfANonMemberReturns404() throws Exception {
+        UUID roomId = UUID.randomUUID();
+        when(roomMemberService.getSelfMembership(eq("outsider"), eq(roomId))).thenThrow(new RoomNotFoundException(roomId));
+
+        mockMvc.perform(get("/rooms/" + roomId + "/members/me").with(jwt().jwt(builder -> builder.subject("outsider"))))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("ROOM_NOT_FOUND"));
+    }
 }

@@ -30,4 +30,14 @@ public class RoomMemberService {
         roomAccessService.requireMembership(roomId, userId);
         return roomMemberRepository.findByRoomIdOrderByJoinedAtAsc(roomId);
     }
+
+    /**
+     * Backs {@code GET /rooms/{roomId}/members/me} (CHAT-107) - a cheap
+     * boolean-shaped self-check, deliberately lighter than
+     * {@link #listMembers} (no member-list fanout).
+     */
+    @Transactional(readOnly = true)
+    public RoomMember getSelfMembership(String userId, UUID roomId) {
+        return roomAccessService.requireSelfMembership(roomId, userId);
+    }
 }

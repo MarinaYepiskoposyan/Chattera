@@ -41,4 +41,19 @@ public class RoomAccessService {
         return roomMemberRepository.findByRoomIdAndUserId(roomId, userId)
                 .orElseThrow(() -> new NotRoomMemberException(roomId));
     }
+
+    /**
+     * Self-membership check backing {@code GET /rooms/{roomId}/members/me}
+     * (CHAT-107, used by ws-gateway's subscribe-time authz). Unlike
+     * {@link #requireMembership}, a non-member gets the <b>same</b>
+     * {@link RoomNotFoundException} (404) as a non-existent room, per
+     * solution-architecture.md: "same response, to avoid room-existence
+     * enumeration" - this endpoint is deliberately not the 403-yielding
+     * post/read/leave check.
+     */
+    public RoomMember requireSelfMembership(UUID roomId, String userId) {
+        requireRoom(roomId);
+        return roomMemberRepository.findByRoomIdAndUserId(roomId, userId)
+                .orElseThrow(() -> new RoomNotFoundException(roomId));
+    }
 }

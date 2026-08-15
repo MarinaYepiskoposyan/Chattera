@@ -14,6 +14,7 @@ import com.chattera.chat.domain.RoomMember;
 import com.chattera.chat.domain.RoomRole;
 import com.chattera.chat.repository.RoomMemberRepository;
 import com.chattera.chat.service.exception.NotRoomMemberException;
+import com.chattera.chat.service.exception.RoomNotFoundException;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -61,5 +62,25 @@ class RoomMemberServiceTest {
         assertThatThrownBy(() -> roomMemberService.listMembers("outsider", roomId))
                 .isInstanceOf(NotRoomMemberException.class);
         verify(roomMemberRepository, never()).findByRoomIdOrderByJoinedAtAsc(any());
+    }
+
+    @Test
+    void getSelfMembershipDelegatesToRoomAccessServicesSelfMembershipCheck() {
+        UUID roomId = UUID.randomUUID();
+        RoomMember member = new RoomMember(roomId, "user-1", RoomRole.MEMBER, Instant.now());
+        when(roomAccessService.requireSelfMembership(roomId, "user-1")).thenReturn(member);
+
+        RoomMember result = roomMemberService.getSelfMembership("user-1", roomId);
+
+        assertThat(result).isEqualTo(member);
+    }
+
+    @Test
+    void getSelfMembershipPropagatesNotFoundForANonMember() {
+        UUID roomId = UUID.randomUUID();
+        doThrow(new RoomNotFoundException(roomId)).when(roomAccessService).requireSelfMembership(roomId, "outsider");
+
+        assertThatThrownBy(() -> roomMemberService.getSelfMembership("outsider", roomId))
+                .isInstanceOf(RoomNotFoundException.class);
     }
 }

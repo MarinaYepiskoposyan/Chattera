@@ -16,18 +16,62 @@
 
   <name>Chattera :: Services :: WS Gateway</name>
   <description>
-    WebSocket edge service (real-time delivery, typing, presence writes).
-    Scaffold only for Sprint 1: exposes /actuator/health, no business logic.
+    WebSocket edge service (CHAT-107): STOMP-over-WebSocket real-time message
+    delivery, delivered/read receipts, and Redis presence-key writes. Consumes
+    chat-service's RabbitMQ events on a per-pod broadcast queue and republishes
+    into an in-memory Spring simple broker - see solution-architecture.md
+    "Real-time delivery - CHAT-107 implementation decisions".
   </description>
 
   <dependencies>
+    <!-- shared platform modules -->
+    <dependency>
+      <groupId>com.chattera</groupId>
+      <artifactId>common-domain</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.chattera</groupId>
+      <artifactId>common-security</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.chattera</groupId>
+      <artifactId>common-messaging</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>com.chattera</groupId>
+      <artifactId>common-observability</artifactId>
+    </dependency>
+
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-web</artifactId>
     </dependency>
     <dependency>
       <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-websocket</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.security</groupId>
+      <artifactId>spring-security-test</artifactId>
+      <scope>test</scope>
     </dependency>
   </dependencies>
 

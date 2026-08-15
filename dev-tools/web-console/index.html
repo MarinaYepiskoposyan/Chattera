@@ -94,6 +94,10 @@
     </section>
   </main>
 
+  <!-- STOMP-over-WebSocket client (CHAT-107 real-time delivery) via CDN -
+       keeps the "no build step" constraint from the original dev-console
+       work. UMD bundle exposes the global `StompJs`. -->
+  <script src="https://cdn.jsdelivr.net/npm/@stomp/stompjs@7/bundles/stomp.umd.min.js"></script>
   <script src="config.js"></script>
   <script src="app.js"></script>
 </body>

@@ -2,6 +2,34 @@ spring:
   application:
     name: ws-gateway
 
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST:localhost}
+      port: ${SPRING_DATA_REDIS_PORT:6379}
+
+  rabbitmq:
+    host: ${SPRING_RABBITMQ_HOST:localhost}
+    port: ${SPRING_RABBITMQ_PORT:5672}
+    username: ${SPRING_RABBITMQ_USERNAME:chattera}
+    password: ${SPRING_RABBITMQ_PASSWORD:changeme_rabbitmq_dev_password}
+
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Keycloak realm issuer. Defaults to devops-engineer's local
+          # docker-compose Keycloak (see infra/README.md); override via
+          # KEYCLOAK_ISSUER_URI for other environments.
+          issuer-uri: ${KEYCLOAK_ISSUER_URI:http://localhost:8080/realms/chattera}
+
+chattera:
+  ws-gateway:
+    # chat-service's own base URL - used only for the subscribe-time/read
+    # membership check (GET /rooms/{roomId}/members/me), forwarding the
+    # connected user's own bearer token. See solution-architecture.md
+    # "Subscribe-time authorization".
+    chat-service-base-url: ${CHAT_SERVICE_BASE_URL:http://localhost:8083}
+
 server:
   port: 8081
 
@@ -14,3 +42,9 @@ management:
     health:
       probes:
         enabled: true
+  health:
+    # RabbitMQ is transient delivery, not the source of truth - a broker
+    # outage must not flip ws-gateway's liveness/readiness to DOWN (mirrors
+    # chat-service's application.yml rationale).
+    rabbit:
+      enabled: false

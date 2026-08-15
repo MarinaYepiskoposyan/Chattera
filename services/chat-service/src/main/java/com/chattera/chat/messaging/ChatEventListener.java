@@ -6,6 +6,7 @@ import org.springframework.transaction.event.TransactionalEventListener;
 
 import com.chattera.domain.event.DomainEvent;
 import com.chattera.domain.event.RoomMessageCreatedEvent;
+import com.chattera.domain.event.RoomMessageStatusChangedEvent;
 import com.chattera.messaging.EventPublisher;
 
 /**
@@ -30,6 +31,18 @@ public class ChatEventListener {
 
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onRoomMessageCreated(RoomMessageCreatedEvent event) {
+        eventPublisher.publish("room." + event.roomId(), event);
+    }
+
+    /**
+     * CHAT-107 receipt write-back, published by {@code MessageStatusService}
+     * after it advances a message's status. Same routing-key family as
+     * {@link #onRoomMessageCreated} ({@code room.<roomId>}) so it rides the
+     * same ws-gateway broadcast queue and reaches the sender's
+     * {@code /topic/rooms.{roomId}} subscription.
+     */
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void onRoomMessageStatusChanged(RoomMessageStatusChangedEvent event) {
         eventPublisher.publish("room." + event.roomId(), event);
     }
 }
