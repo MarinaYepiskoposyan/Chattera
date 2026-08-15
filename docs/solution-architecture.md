@@ -540,13 +540,110 @@ infrequent subscribe/read events, not the delivery hot path.
   confidential client" decision). If the captured token has expired, the call returns 401 and
   ws-gateway rejects the SUBSCRIBE; the client reconnects with a fresh token. (Refreshing the
   token over a live socket is a post-Sprint-1 hardening, noted, not built here.)
-- **Caching (bounded staleness).** ws-gateway caches a positive `(userId, roomId)` result
-  in-memory for the socket session with a short TTL (~60 s) to avoid re-hitting chat-service on
-  reconnect/re-SUBSCRIBE storms and on each `/app/message.read`. A user who *left* a room
-  keeps delivery for at most the TTL, which is low-risk (they refetch/reconnect and stop
-  seeing it); membership grants are the common case and rarely revoked mid-session.
+- **Caching (what the cache does — and does not — bound).** ws-gateway caches a positive
+  `(sessionId, roomId)` result in-memory with a short TTL (~60 s) to avoid re-hitting
+  chat-service on reconnect/re-SUBSCRIBE storms and on each `/app/message.read`. **This cache
+  only short-circuits *future client-initiated* SUBSCRIBE / `message.read` calls; it does
+  nothing to an already-admitted subscription.** Once a SUBSCRIBE is admitted to the pod's
+  simple-broker subscription registry, `RoomEventBroadcastListener` keeps delivering to it for
+  the life of the STOMP session regardless of the cache — the TTL expiring is a passive
+  cache-miss on the *next* client call, not a re-check of live subscriptions. Revocation of an
+  already-open subscription is therefore **not** handled by the cache TTL; it is handled by the
+  explicit membership-revoked event in §4 below. (Historical note: an earlier version of this
+  section claimed "a user who left a room keeps delivery for at most the TTL (~60 s)" — that was
+  **factually wrong** against the implementation and is corrected by §4; a left user's live
+  subscription was in fact never re-checked and kept delivering until disconnect. Bug fixed
+  under CHAT-37.)
 - **`/app/message.read` reuses the same check** before publishing a `MessageReadEvent`, so a
   non-member cannot forge read receipts.
+
+#### 4. Membership revocation of a live subscription — `RoomMembershipRevokedEvent` (CHAT-37)
+The subscribe-time check in §3 admits a subscription **once**; nothing re-checks it afterwards,
+so a user who leaves a room (or, once that endpoint exists, is removed by the owner) keeps
+receiving every message on their still-open `/topic/rooms.{roomId}` subscription until they
+disconnect. That is the CHAT-37 authorization-staleness bug.
+
+**Decision — event-driven revocation (chosen over periodic re-check).** When a membership ends,
+chat-service publishes a `RoomMembershipRevokedEvent`; ws-gateway consumes it and force-drops
+that user's live subscription to the room. Chosen because:
+- It is **O(actual leave/remove events)**, which are infrequent, rather than the O(live
+  subscriptions × time) continuous polling load that a periodic re-check (or a TTL-expiry-driven
+  re-verify) would put on chat-service — the wrong cost curve to add for a rare event, and it
+  grows with the connection count we are explicitly trying to scale.
+- It is **architecturally consistent**: it reuses the exact persist-then-publish path chat-service
+  already uses for `RoomMessageCreatedEvent`/`RoomMessageStatusChangedEvent`, the same
+  `room.<roomId>` routing-key family, the same per-pod `room.#` broadcast queue on ws-gateway,
+  and the same `@RabbitHandler`-by-type dispatch — **no new broker queue or binding**.
+- It revokes in **broker-latency time (sub-second)** rather than up to ~60 s.
+
+**New shared event (add to `common-domain`, a record implementing `DomainEvent`, mirroring
+`MessageDeliveredEvent`):**
+
+```
+// Published by chat-service after a user's membership in a room ends (self-leave now;
+// owner-removal when that endpoint is added). Consumed by ws-gateway, which force-drops
+// that user's live subscription to /topic/rooms.{roomId}.
+// Routing key: room.<roomId> — same family as RoomMessageCreatedEvent, so it rides the
+// existing per-pod broadcast queue (room.# binding); every pod receives it, and only the
+// pod(s) holding that user's socket act on it.
+RoomMembershipRevokedEvent(UUID roomId, String userId, Instant occurredAt)
+```
+
+**Publish side (chat-service).** In `RoomService.leaveRoom`, after `roomMemberRepository.delete(
+membership)` and still inside the `@Transactional` method, publish a Spring application event:
+`applicationEventPublisher.publishEvent(new RoomMembershipRevokedEvent(roomId, userId, Instant.now()))`
+(inject `ApplicationEventPublisher` exactly as `MessageService` does). Add a
+`@TransactionalEventListener(phase = AFTER_COMMIT)` handler to `ChatEventListener` that calls
+`eventPublisher.publish("room." + event.roomId(), event)`. AFTER_COMMIT is required so a
+rolled-back leave never emits a phantom revoke — identical to the message/receipt path. Notes:
+- The OWNER-leave auto-transfer promotes a new owner, but only the **leaver** is revoked (single
+  `userId`); the promoted owner keeps their subscription. Correct as-is.
+- A future owner-remove-member endpoint MUST publish the same event for the removed `userId`.
+
+**Consume side (ws-gateway).** Add a `@RabbitHandler` to `RoomEventBroadcastListener` for
+`RoomMembershipRevokedEvent`. Unlike the message/status handlers it **must NOT `convertAndSend`
+the event to `/topic/rooms.{roomId}`** (that would fan a revoke out to every subscriber); it
+targets only the revoked user's own subscription(s):
+1. `simpUserRegistry.findSubscriptions(...)` filtered to subscriptions whose destination equals
+   `/topic/rooms.{roomId}` **and** whose `getSession().getUser().getName()` equals `event.userId()`.
+2. For each match, **force-unsubscribe** exactly that `(sessionId, subscriptionId)` by sending a
+   synthetic STOMP `UNSUBSCRIBE` onto the injected `clientInboundChannel`
+   (`@Qualifier("clientInboundChannel") MessageChannel`):
+   ```
+   StompHeaderAccessor a = StompHeaderAccessor.create(StompCommand.UNSUBSCRIBE);
+   a.setSessionId(subscription.getSession().getId());
+   a.setSubscriptionId(subscription.getId());
+   a.setLeaveMutable(true);
+   clientInboundChannel.send(MessageBuilder.createMessage(new byte[0], a.getMessageHeaders()));
+   ```
+   The simple broker processes this identically to a client-sent UNSUBSCRIBE, removing just that
+   one subscription and leaving the socket and the user's other room subscriptions intact.
+   `StompAuthChannelInterceptor` only acts on CONNECT/SUBSCRIBE, so the synthetic UNSUBSCRIBE
+   passes through untouched.
+3. **Evict the stale positive cache entry** for that `(sessionId, roomId)` — add
+   `RoomMembershipChecker.evict(String sessionId, UUID roomId)` (removing the single cache key,
+   distinct from the existing session-wide `evictSession`). This is **mandatory**: without it a
+   just-revoked client that re-SUBSCRIBEs within the ~60 s TTL would be re-admitted from the
+   stale positive cache instead of re-hitting chat-service (which now returns 404).
+
+Pods that do not hold the user's socket find no matching subscription and no-op — the broadcast
+is safe to fan to all pods.
+
+**Residual staleness bound (honest).** Under normal operation revocation is bounded by
+broker+handler latency (sub-second). The one remaining gap: publish is best-effort and never
+throws (the `EventPublisher` contract), and the event is not retried, so during a broker outage a
+left user's subscription could keep delivering until their socket next reconnects (at which point
+the room is gone from their REST room-list and is not re-SUBSCRIBEd). This is consistent with the
+existing "bus is best-effort, Postgres is source of truth" posture and is closed by the same
+deferred transactional-outbox hardening already noted for the producer path — acceptable for
+Sprint 1, recorded not hidden.
+
+**Alternative mechanism (fallback, if the targeted UNSUBSCRIBE proves fiddly).** Closing the
+user's whole WebSocket session also revokes correctly and self-heals via the existing lossless
+reconnect (client re-fetches its room list — now without the left room — and re-SUBSCRIBEs), and
+reuses `WebSocketSessionLifecycleListener`'s existing cleanup. It is blunter (drops the user's
+*other* room subscriptions too, forcing a full reconnect for a single-room leave), so the targeted
+UNSUBSCRIBE above is preferred; socket-close is an acceptable fallback, not the default.
 
 ## Sprint 1 Architecture Focus
 - define API contracts
