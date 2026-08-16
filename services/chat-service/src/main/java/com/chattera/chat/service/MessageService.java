@@ -45,7 +45,7 @@ public class MessageService {
      * Persists the message, then publishes a {@link RoomMessageCreatedEvent}
      * Spring application event. That event is picked up by
      * {@code ChatEventListener} with {@code phase = AFTER_COMMIT}, so the
-     * RabbitMQ publish only happens once this transaction has actually
+     * Kafka publish only happens once this transaction has actually
      * committed - "persist-then-publish", per solution-architecture.md.
      */
     @Transactional

@@ -1,7 +1,7 @@
 package com.chattera.chat.messaging;
 
-import org.springframework.amqp.rabbit.annotation.RabbitHandler;
-import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.kafka.annotation.KafkaHandler;
+import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Component;
 
 import com.chattera.chat.service.MessageStatusService;
@@ -9,17 +9,13 @@ import com.chattera.domain.event.MessageDeliveredEvent;
 import com.chattera.domain.event.MessageReadEvent;
 
 /**
- * Consumes {@code receipt.*} events published by ws-gateway (CHAT-107) from
- * {@link ReceiptQueueConfig#QUEUE_NAME}. A single {@code @RabbitListener}
- * class with {@code @RabbitHandler}-annotated overloads (rather than two
- * separate listeners on the same queue, which would compete for each
- * message) lets both event types share one queue - the shared
- * {@code Jackson2JsonMessageConverter} from common-messaging dispatches by
- * the concrete payload type carried in the message's {@code __TypeId__}
- * header.
+ * Consumes receipt events published by ws-gateway (CHAT-107) from the
+ * shared Chattera event stream. A single listener class with typed handlers
+ * lets both event types share the same topic pattern while keeping message
+ * processing explicit and room-scoped.
  */
 @Component
-@RabbitListener(queues = ReceiptQueueConfig.QUEUE_NAME)
+@KafkaListener(topicPattern = "chattera.events.*")
 public class ReceiptEventListener {
 
     private final MessageStatusService messageStatusService;
@@ -28,13 +24,23 @@ public class ReceiptEventListener {
         this.messageStatusService = messageStatusService;
     }
 
-    @RabbitHandler
+    @KafkaHandler
     public void onDelivered(MessageDeliveredEvent event) {
         messageStatusService.applyDelivered(event);
     }
 
-    @RabbitHandler
+    @KafkaHandler
     public void onRead(MessageReadEvent event) {
         messageStatusService.applyRead(event);
+    }
+
+    /**
+     * The shared chattera.events.* wildcard subscription also assigns this listener every
+     * other event type on the namespace (room message/status/membership events, published
+     * by chat-service itself). Without a default handler Spring throws for any payload type
+     * with no matching @KafkaHandler; this is a deliberate no-op, not a bug.
+     */
+    @KafkaHandler(isDefault = true)
+    public void onOtherEvent(Object event) {
     }
 }

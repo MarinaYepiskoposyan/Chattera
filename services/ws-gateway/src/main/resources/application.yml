@@ -7,11 +7,15 @@ spring:
       host: ${SPRING_DATA_REDIS_HOST:localhost}
       port: ${SPRING_DATA_REDIS_PORT:6379}
 
-  rabbitmq:
-    host: ${SPRING_RABBITMQ_HOST:localhost}
-    port: ${SPRING_RABBITMQ_PORT:5672}
-    username: ${SPRING_RABBITMQ_USERNAME:chattera}
-    password: ${SPRING_RABBITMQ_PASSWORD:changeme_rabbitmq_dev_password}
+  kafka:
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: ws-gateway
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      properties:
+        spring.json.trusted.packages: "com.chattera.domain.event"
 
   security:
     oauth2:
@@ -43,8 +47,8 @@ management:
       probes:
         enabled: true
   health:
-    # RabbitMQ is transient delivery, not the source of truth - a broker
+    # Kafka is transient delivery, not the source of truth - a broker
     # outage must not flip ws-gateway's liveness/readiness to DOWN (mirrors
     # chat-service's application.yml rationale).
-    rabbit:
+    kafka:
       enabled: false

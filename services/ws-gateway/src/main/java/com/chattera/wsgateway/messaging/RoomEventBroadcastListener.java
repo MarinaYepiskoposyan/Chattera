@@ -3,9 +3,9 @@ package com.chattera.wsgateway.messaging;
 import java.time.Instant;
 import java.util.Set;
 
-import org.springframework.amqp.rabbit.annotation.RabbitHandler;
-import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.kafka.annotation.KafkaHandler;
+import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.messaging.MessageChannel;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.messaging.simp.stomp.StompCommand;
@@ -25,20 +25,13 @@ import com.chattera.messaging.EventPublisher;
 import com.chattera.wsgateway.membership.RoomMembershipChecker;
 
 /**
- * Consumes this pod's broadcast queue ({@code BroadcastQueueConfig}, bound
- * {@code room.#}) and republishes each event into the local Spring simple
- * broker via {@link SimpMessagingTemplate} - the hand-off point where the
- * pod's own subscription registry takes over delivery filtering (developer
- * does not hand-roll a roomId-&gt;session map; Spring maintains it). See
- * solution-architecture.md "Real-time delivery - CHAT-107 implementation
- * decisions".
- *
- * <p>A single {@code @RabbitListener} class with {@code @RabbitHandler}
- * overloads (mirroring chat-service's {@code ReceiptEventListener}) lets
- * both event types share this pod's one broadcast queue.
+ * Consumes the shared room-scoped Kafka event stream and republishes each
+ * event into the local Spring simple broker via {@link SimpMessagingTemplate}.
+ * The pod-level subscription registry remains the delivery filter, while Kafka
+ * provides the durable transport from chat-service.
  */
 @Component
-@RabbitListener(queues = "#{wsGatewayBroadcastQueue.name}")
+@KafkaListener(topicPattern = "chattera.events.*")
 public class RoomEventBroadcastListener {
 
     private static final String TOPIC_ROOM_PREFIX = "/topic/rooms.";
@@ -62,14 +55,14 @@ public class RoomEventBroadcastListener {
         this.roomMembershipChecker = roomMembershipChecker;
     }
 
-    @RabbitHandler
+    @KafkaHandler
     public void onRoomMessageCreated(RoomMessageCreatedEvent event) {
         String destination = TOPIC_ROOM_PREFIX + event.roomId();
         messagingTemplate.convertAndSend(destination, event);
         emitDeliveredForLocallyConnectedRecipients(event, destination);
     }
 
-    @RabbitHandler
+    @KafkaHandler
     public void onRoomMessageStatusChanged(RoomMessageStatusChangedEvent event) {
         messagingTemplate.convertAndSend(TOPIC_ROOM_PREFIX + event.roomId(), event);
     }
@@ -89,7 +82,7 @@ public class RoomEventBroadcastListener {
      * matching subscription and no-op - the broadcast is safe to fan to all
      * pods. See solution-architecture.md §4.
      */
-    @RabbitHandler
+    @KafkaHandler
     public void onRoomMembershipRevoked(RoomMembershipRevokedEvent event) {
         String destination = TOPIC_ROOM_PREFIX + event.roomId();
         Set<SimpSubscription> subscriptions = simpUserRegistry.findSubscriptions(subscription ->
@@ -101,6 +94,16 @@ public class RoomEventBroadcastListener {
             forceUnsubscribe(subscription);
             roomMembershipChecker.evict(subscription.getSession().getId(), event.roomId());
         }
+    }
+
+    /**
+     * The shared chattera.events.* wildcard subscription also assigns this listener every
+     * other event type on the namespace (receipt events, published by ws-gateway itself and
+     * consumed by chat-service). Without a default handler Spring throws for any payload
+     * type with no matching @KafkaHandler; this is a deliberate no-op, not a bug.
+     */
+    @KafkaHandler(isDefault = true)
+    public void onOtherEvent(Object event) {
     }
 
     private void forceUnsubscribe(SimpSubscription subscription) {

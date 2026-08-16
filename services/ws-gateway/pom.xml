@@ -18,7 +18,7 @@
   <description>
     WebSocket edge service (CHAT-107): STOMP-over-WebSocket real-time message
     delivery, delivered/read receipts, and Redis presence-key writes. Consumes
-    chat-service's RabbitMQ events on a per-pod broadcast queue and republishes
+    chat-service's Kafka events from the shared topic stream and republishes
     into an in-memory Spring simple broker - see solution-architecture.md
     "Real-time delivery - CHAT-107 implementation decisions".
   </description>

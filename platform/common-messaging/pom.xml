@@ -17,13 +17,10 @@
   <name>Chattera :: Platform :: Common Messaging</name>
   <description>
     Event-bus abstraction (EventPublisher) plus its concrete transport,
-    decided in CHAT-104: RabbitMQ via Spring AMQP (see
-    solution-architecture.md, "Event bus decision - RabbitMQ"). Services that
-    depend on this module and have spring-boot-starter-amqp on the classpath
-    (transitively pulled in here) get an EventPublisher&lt;DomainEvent&gt; bean
-    auto-configured for free, publishing to a shared topic exchange keyed by
-    the caller-supplied routing key - the same auto-configuration pattern
-    common-security uses for JWT handling.
+    implemented via Kafka using Spring for Apache Kafka. Services that depend
+    on this module and have spring-kafka on the classpath get an
+    EventPublisher&lt;DomainEvent&gt; bean auto-configured for free,
+    publishing to a shared topic namespace keyed by the caller-supplied topic.
   </description>
 
   <dependencies>
@@ -33,7 +30,11 @@
     </dependency>
     <dependency>
       <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-amqp</artifactId>
+      <artifactId>spring-boot-starter</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.kafka</groupId>
+      <artifactId>spring-kafka</artifactId>
     </dependency>
 
     <dependency>

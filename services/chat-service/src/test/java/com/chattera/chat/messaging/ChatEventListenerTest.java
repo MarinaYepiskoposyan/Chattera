@@ -27,7 +27,7 @@ class ChatEventListenerTest {
 
         listener.onRoomMessageCreated(event);
 
-        verify(eventPublisher).publish("room." + roomId, event);
+        verify(eventPublisher).publish("room-message-created." + roomId, event);
     }
 
     @Test
@@ -41,7 +41,7 @@ class ChatEventListenerTest {
 
         listener.onRoomMessageStatusChanged(event);
 
-        verify(eventPublisher).publish("room." + roomId, event);
+        verify(eventPublisher).publish("room-message-status-changed." + roomId, event);
     }
 
     @Test
@@ -54,6 +54,6 @@ class ChatEventListenerTest {
 
         listener.onRoomMembershipRevoked(event);
 
-        verify(eventPublisher).publish("room." + roomId, event);
+        verify(eventPublisher).publish("room-membership-revoked." + roomId, event);
     }
 }

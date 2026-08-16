@@ -11,7 +11,7 @@ for the real Chattera web client.
 ## Prerequisites
 
 - The local infra stack up: `docker compose up -d` from the repo root
-  (Postgres, Redis, Keycloak, RabbitMQ — see `infra/README.md`).
+  (Postgres, Redis, Keycloak, Kafka — see `infra/README.md`).
 - `profile-service` (port 8082), `chat-service` (port 8083), and `ws-gateway`
   (port 8081) all running (`mvn spring-boot:run` from each service directory
   — see the root `CLAUDE.md` "Build/test" section). `ws-gateway` is only

@@ -33,7 +33,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
  * CHAT-37: exercises the actual "persist-then-publish" wiring end to end -
  * {@code RoomService.leaveRoom} publishing a Spring application event that
  * {@link ChatEventListener}'s {@code AFTER_COMMIT} handler bridges onto the
- * (mocked) RabbitMQ {@link EventPublisher} - against a real transaction
+ * (mocked) Kafka {@link EventPublisher} - against a real transaction
  * manager, rather than unit-testing either class in isolation. A rolled-back
  * leave must never reach the event bus; this is what {@code AFTER_COMMIT}
  * (vs. a plain {@code @EventListener}) guarantees, and is the one behavior
@@ -71,7 +71,7 @@ class RoomServiceMembershipRevocationEventTest {
 
         transactionTemplate.executeWithoutResult(status -> roomService.leaveRoom("user-2", roomId));
 
-        verify(eventPublisher).publish(eq("room." + roomId), any(RoomMembershipRevokedEvent.class));
+        verify(eventPublisher).publish(eq("room-membership-revoked." + roomId), any(RoomMembershipRevokedEvent.class));
     }
 
     @Test

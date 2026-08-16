@@ -51,16 +51,15 @@ Decided this session (do not re-litigate; these are the working baseline):
 - Build tooling: Maven multi-module monorepo (`platform/*` shared libraries consumed by
   `services/*`). Decided — the repo is built on it and profile-service ships on it. (The
   earlier "Gradle proposed" note is superseded.)
-- Event bus: **RabbitMQ via Spring AMQP** (decided CHAT-104 — see "Chat Rooms & Messaging"
-  below). chat-service is the first producer onto the backbone; the `EventPublisher`
-  abstraction in `platform/common-messaging` gets its first concrete transport here.
-  Rationale and the options weighed are documented in the CHAT-104 section. WebSocket
-  delivery (ws-gateway) uses Spring WebSocket + STOMP with an **in-memory simple broker per
-  pod** fed by a **single broadcast queue per pod** on `chattera.events` (CHAT-24 §3 topology;
-  wired in CHAT-107). The earlier "RabbitMQ STOMP broker relay per subscription" note is
-  **superseded** — that model created a broker queue/binding per subscription and was rejected
-  in CHAT-24 §3. See the "Real-time delivery — CHAT-107 implementation decisions" subsection
-  below for exact destinations, receipt flow, and subscribe-time authz.
+- Event bus: **Kafka via Spring Kafka** (chosen for the target design; see "Chat Rooms &
+  Messaging" below). chat-service is the first producer onto the backbone; the
+  `EventPublisher` abstraction in `platform/common-messaging` is the broker-agnostic seam
+  and is implemented with Kafka as the concrete transport. WebSocket delivery
+  (`ws-gateway`) consumes Kafka topics and republish them to STOMP subscribers using its
+  local in-memory subscription registry. The earlier RabbitMQ-based broadcast queue model is
+  **superseded** and explicitly rejected for the target architecture. See the "Real-time
+  delivery — CHAT-107 implementation decisions" subsection below for exact destinations,
+  receipt flow, and subscribe-time authz.
 
 Proposed, pending Sprint 1 refinement with developer/qa-engineer:
 - Data access: Spring Data JPA/Hibernate for CRUD velocity in Sprint 1; the message
@@ -197,31 +196,220 @@ participants, message history) with deliberate boundaries to FR-03 (DMs, CHAT-10
 FR-05 (real-time + delivered/read status, CHAT-107). Follows the profile-service
 precedent: an independent OAuth2 resource server, Flyway-owned schema, JPA for CRUD.
 
-### Event bus decision — RabbitMQ (Spring AMQP)
-Decided here because CHAT-104 is the first producer and the choice blocks implementation.
+### Event bus decision — Kafka (Spring Kafka)
+The event backbone is now Kafka instead of RabbitMQ. The Kafka choice is driven by the need
+for durable, replayable event streams and stable partitioning by `roomId` / `userId`, while
+PostgreSQL remains the source of truth for message history and room state.
 Options weighed:
-- **RabbitMQ (chosen).** Chat delivery is a routing/fanout problem — one room message fans
-  out to N member sockets, one DM routes to a single recipient's sockets — which is exactly
-  the topic-exchange model. Spring AMQP is first-class and matches the low-ceremony DX of
-  the existing services. Its STOMP broker relay lets multiple ws-gateway instances all
-  receive a published message with no app-level coordination, which is what keeps ws-gateway
-  stateless behind the load balancer (CHAT-107). Modest operational footprint (one broker
-  container added to `docker-compose.yml`, owned with devops-engineer).
-- **Kafka (rejected for Sprint 1).** Its strengths — partitioned durable log, replay,
-  high-throughput streaming — are the 1M-scale concerns that are explicitly deferred.
-  Adopting it now is premature commitment and a heavier ops burden for MVP.
-- **Redis Streams/Pub-Sub (rejected).** Pub/Sub is fire-and-forget (a message published
-  while ws-gateway is momentarily down is lost); Streams would work but is lower-level with
-  weaker Spring ergonomics, and it concentrates cache + presence + durable bus onto one
-  Redis instance. Not worth it when RabbitMQ fits the fanout model directly.
+- **Kafka (chosen).** Chat delivery is both a fan-out problem and a durable-event-stream
+  problem. Kafka gives us partitioned topics, replayable event history, multi-subscriber
+  consumer groups, and a stable ordering model per partition. `roomId` can be used as the
+  partition key so all events for one room land in one log; ws-gateway can consume a
+  dedicated consumer group for delivery and another for receipts/read-state. Spring Kafka
+  fits the app architecture cleanly and keeps the event model explicit across services.
+- **RabbitMQ (rejected for the target design).** RabbitMQ is simpler for a single fan-out
+  broker, but it is less suitable for long-lived event replay and cross-service stream
+  processing. It also couples the real-time path more tightly to queue semantics than the
+  Chattera target design prefers.
+- **Redis Streams/Pub-Sub (rejected).** Pub/Sub is fire-and-forget and loses messages on
+  transient downtime; Streams would work but still concentrate too much cache/presence/bus
+  logic in Redis and give weaker semantics than Kafka for a multi-consumer event backbone.
 
 **The bus is transient delivery, not the message store.** PostgreSQL remains the single
 source of truth for message history. A message is persisted (committed) *before* it is
 published; a dropped/undelivered event never loses data because clients re-fetch recent
-history on (re)connect. This keeps RabbitMQ durability requirements modest for Sprint 1.
+history on (re)connect. Kafka durability reduces the risk of lost events during consumer
+restarts and makes replay feasible without forcing a rebuild from the database.
 Publish is best-effort: a publish failure is logged and must **not** fail the REST write.
-A transactional outbox (publish exactly-once, tied to the DB commit) is noted as later
-hardening — deferred, not Sprint 1.
+A transactional outbox (publish exactly-once, tied to the DB commit) is a later hardening
+step and should be introduced once the event model is stable.
+
+### Kafka event catalog and examples
+All events are emitted as a common envelope so consumers can handle topics uniformly while
+preserving a topic-specific payload. The envelope keeps a stable contract for every producer;
+consumers do not need to inspect the topic to know the metadata fields.
+
+**Envelope**
+```json
+{
+  "eventId": "7dfe8af2-4f58-4c5d-9acf-9a4f1aa43117",
+  "eventType": "ROOM_MESSAGE_CREATED",
+  "aggregateType": "MESSAGE",
+  "aggregateId": "msg_01962d0b-80d1-4d7b-8c7a-60c97f597fcb",
+  "roomId": "room_1b0db96e-671a-4b40-a0cc-17e9fe58dff1",
+  "userId": "user_7f8f4f35-9d0d-47f2-a662-76ed13001a2d",
+  "occurredAt": "2026-08-16T12:00:00Z",
+  "version": 1,
+  "payload": {
+    "messageId": "msg_01962d0b-80d1-4d7b-8c7a-60c97f597fcb",
+    "roomId": "room_1b0db96e-671a-4b40-a0cc-17e9fe58dff1",
+    "senderUserId": "user_7f8f4f35-9d0d-47f2-a662-76ed13001a2d",
+    "content": "hello team",
+    "messageType": "TEXT",
+    "createdAt": "2026-08-16T12:00:00Z"
+  }
+}
+```
+
+**1) Room message created**
+- Topic: `chattera.events.room-message-created`
+- Key: `roomId`
+- Producer: `chat-service`
+- Consumer: `ws-gateway` (push to room subscribers), future analytics/moderation consumers
+
+```json
+{
+  "eventId": "7dfe8af2-4f58-4c5d-9acf-9a4f1aa43117",
+  "eventType": "ROOM_MESSAGE_CREATED",
+  "aggregateType": "MESSAGE",
+  "aggregateId": "msg_01962d0b-80d1-4d7b-8c7a-60c97f597fcb",
+  "roomId": "room_1b0db96e-671a-4b40-a0cc-17e9fe58dff1",
+  "userId": "user_7f8f4f35-9d0d-47f2-a662-76ed13001a2d",
+  "occurredAt": "2026-08-16T12:00:00Z",
+  "version": 1,
+  "payload": {
+    "messageId": "msg_01962d0b-80d1-4d7b-8c7a-60c97f597fcb",
+    "roomId": "room_1b0db96e-671a-4b40-a0cc-17e9fe58dff1",
+    "senderUserId": "user_7f8f4f35-9d0d-47f2-a662-76ed13001a2d",
+    "content": "hello team",
+    "messageType": "TEXT",
+    "createdAt": "2026-08-16T12:00:00Z"
+  }
+}
+```
+
+**2) Message delivered**
+- Topic: `chattera.events.room-message-delivered`
+- Key: `messageId` (or recipient user id when delivery is tracked per recipient)
+- Producer: `ws-gateway`
+- Consumer: `chat-service` (updates message status in Postgres)
+
+```json
+{
+  "eventId": "8ed15b68-6d4f-46a1-9d22-69478d724b25",
+  "eventType": "ROOM_MESSAGE_DELIVERED",
+  "aggregateType": "MESSAGE",
+  "aggregateId": "msg_01962d0b-80d1-4d7b-8c7a-60c97f597fcb",
+  "roomId": "room_1b0db96e-671a-4b40-a0cc-17e9fe58dff1",
+  "userId": "user_bc5313f4-2c40-44d3-bac0-3f431d580d6b",
+  "occurredAt": "2026-08-16T12:00:10Z",
+  "version": 1,
+  "payload": {
+    "messageId": "msg_01962d0b-80d1-4d7b-8c7a-60c97f597fcb",
+    "roomId": "room_1b0db96e-671a-4b40-a0cc-17e9fe58dff1",
+    "recipientUserId": "user_bc5313f4-2c40-44d3-bac0-3f431d580d6b",
+    "deliveredAt": "2026-08-16T12:00:10Z"
+  }
+}
+```
+
+**3) Message read**
+- Topic: `chattera.events.room-message-read`
+- Key: `messageId` or `readerUserId`
+- Producer: `ws-gateway`
+- Consumer: `chat-service` (persists read receipt state)
+
+```json
+{
+  "eventId": "2b29e14c-0dbd-42b9-b53d-54f92003a7de",
+  "eventType": "ROOM_MESSAGE_READ",
+  "aggregateType": "MESSAGE",
+  "aggregateId": "msg_01962d0b-80d1-4d7b-8c7a-60c97f597fcb",
+  "roomId": "room_1b0db96e-671a-4b40-a0cc-17e9fe58dff1",
+  "userId": "user_bc5313f4-2c40-44d3-bac0-3f431d580d6b",
+  "occurredAt": "2026-08-16T12:00:32Z",
+  "version": 1,
+  "payload": {
+    "messageId": "msg_01962d0b-80d1-4d7b-8c7a-60c97f597fcb",
+    "roomId": "room_1b0db96e-671a-4b40-a0cc-17e9fe58dff1",
+    "readerUserId": "user_bc5313f4-2c40-44d3-bac0-3f431d580d6b",
+    "readAt": "2026-08-16T12:00:32Z"
+  }
+}
+```
+
+**4) Room member joined**
+- Topic: `chattera.events.room-member-joined`
+- Key: `roomId`
+- Producer: `chat-service`
+- Consumer: `ws-gateway` / future notifications / moderation tooling
+
+```json
+{
+  "eventId": "35d7b61d-f4b8-491d-9af2-0d09bf2d8d95",
+  "eventType": "ROOM_MEMBER_JOINED",
+  "aggregateType": "ROOM_MEMBER",
+  "aggregateId": "room_1b0db96e-671a-4b40-a0cc-17e9fe58dff1:user_90dbd75c-7d39-4e4f-b215-a1be7e0805d4",
+  "roomId": "room_1b0db96e-671a-4b40-a0cc-17e9fe58dff1",
+  "userId": "user_90dbd75c-7d39-4e4f-b215-a1be7e0805d4",
+  "occurredAt": "2026-08-16T12:01:00Z",
+  "version": 1,
+  "payload": {
+    "roomId": "room_1b0db96e-671a-4b40-a0cc-17e9fe58dff1",
+    "userId": "user_90dbd75c-7d39-4e4f-b215-a1be7e0805d4",
+    "role": "MEMBER",
+    "joinedAt": "2026-08-16T12:01:00Z"
+  }
+}
+```
+
+**5) Presence updated**
+- Topic: `chattera.events.presence-updated`
+- Key: `userId`
+- Producer: `ws-gateway`
+- Consumer: `profile-service` or any presence-aware component
+
+```json
+{
+  "eventId": "f5ee2b8d-82ab-4826-ad52-b8174788dbd7",
+  "eventType": "PRESENCE_UPDATED",
+  "aggregateType": "PRESENCE",
+  "aggregateId": "user_7f8f4f35-9d0d-47f2-a662-76ed13001a2d",
+  "roomId": null,
+  "userId": "user_7f8f4f35-9d0d-47f2-a662-76ed13001a2d",
+  "occurredAt": "2026-08-16T12:02:05Z",
+  "version": 1,
+  "payload": {
+    "userId": "user_7f8f4f35-9d0d-47f2-a662-76ed13001a2d",
+    "online": true,
+    "lastSeenAt": "2026-08-16T12:02:05Z",
+    "source": "WS_GATEWAY"
+  }
+}
+```
+
+**6) File uploaded**
+- Topic: `chattera.events.file-uploaded`
+- Key: `fileId` or `userId`
+- Producer: `file-service`
+- Consumer: `chat-service` / notification consumers / future feed processors
+
+```json
+{
+  "eventId": "d8b0fca7-8b96-4fa8-ae4c-eed9efec1fa0",
+  "eventType": "FILE_UPLOADED",
+  "aggregateType": "FILE",
+  "aggregateId": "file_44eb0c5d-7df4-4a01-9d33-77d406c35b92",
+  "roomId": "room_1b0db96e-671a-4b40-a0cc-17e9fe58dff1",
+  "userId": "user_7f8f4f35-9d0d-47f2-a662-76ed13001a2d",
+  "occurredAt": "2026-08-16T12:03:00Z",
+  "version": 1,
+  "payload": {
+    "fileId": "file_44eb0c5d-7df4-4a01-9d33-77d406c35b92",
+    "roomId": "room_1b0db96e-671a-4b40-a0cc-17e9fe58dff1",
+    "uploadedByUserId": "user_7f8f4f35-9d0d-47f2-a662-76ed13001a2d",
+    "objectKey": "uploads/room_1b0db96e-671a-4b40-a0cc-17e9fe58dff1/file_44eb0c5d-7df4-4a01-9d33-77d406c35b92",
+    "mimeType": "image/png",
+    "sizeBytes": 256000,
+    "storedAt": "2026-08-16T12:03:00Z"
+  }
+}
+```
+
+These event examples define the default contract for the Kafka-based backbone. Every topic
+uses a stable partition key (`roomId`, `userId`, or aggregate id) so message ordering and
+fan-out stays predictable while keeping Postgres as the source of truth for durable domain
+state.
 
 ### Scope split: CHAT-104 vs CHAT-107 (confirmed)
 - **CHAT-104 owns** the REST + persistence + producer side, and is independently
@@ -229,8 +417,9 @@ hardening — deferred, not Sprint 1.
   - REST: create room, join room, leave room, list a room's members, post a message,
     fetch message history.
   - Persistence: rooms, room membership, messages (schema below).
-  - Producing: after the message row commits, publish a `RoomMessageCreated` event to the
-    RabbitMQ topic exchange (routing key by room). If no consumer/queue is bound yet
+  - Producing: after the message row commits, publish a `RoomMessageCreated` event to its
+    Kafka topic (`chattera.events.room-message-created.{roomId}`, auto-created on first
+    publish — see "Event bus decision — Kafka" above). If no consumer is subscribed yet
     (CHAT-107 not built), the event is simply not delivered — acceptable, because history
     is durable in Postgres.
 - **CHAT-107 owns** the consumer/real-time side: ws-gateway subscribing to the bus and
@@ -355,28 +544,27 @@ socket-send path later lands in the same persist+publish logic — a contained c
 
 ### Real-time delivery runtime & the ws-gateway ↔ chat-service relationship
 The two services have **no direct relationship** — they never call each other. Their only
-link is RabbitMQ: chat-service is the **producer**, ws-gateway is the **consumer**. This
+link is Kafka: chat-service is the **producer**, ws-gateway is the **consumer**. This
 decoupling is deliberate and is what lets both tiers be stateless and scale independently.
 - **chat-service** = writer / system of record: REST writes, authz, business rules,
   Postgres persistence, and publishing events. **ws-gateway** = delivery edge: holds live
   sockets, tracks presence, pushes events to clients. No business logic, no DB.
-- **The contract between them is the event, not an API** — its fields + routing key, defined
-  via `common-messaging`/`common-domain` (`DomainEvent`, e.g. `RoomMessageCreated`). The
-  event is **self-contained** (id, sender, content, timestamp, status), so ws-gateway
+- **The contract between them is the event, not an API** — its fields + partition key,
+  defined via `common-messaging`/`common-domain` (`DomainEvent`, e.g. `RoomMessageCreated`).
+  The event is **self-contained** (id, sender, content, timestamp, status), so ws-gateway
   forwards it without querying Postgres or calling chat-service.
 - **End-to-end loop** (through both, but they never touch directly):
-  `Client --REST POST--> chat-service --publish--> RabbitMQ --route--> ws-gateway --WS push--> Client`.
-  Any chat-service instance can publish; any ws-gateway instance can deliver; the broker
-  bridges any-to-any.
+  `Client --REST POST--> chat-service --publish--> Kafka --consume--> ws-gateway --WS push--> Client`.
+  Any chat-service instance can publish; any ws-gateway instance can consume; Kafka bridges
+  any-to-any using consumer groups and partitions.
 - **ws-gateway statelessness** — a live socket is unavoidably transient state on one
   instance, but no *authoritative* state lives there (history→Postgres, presence→Redis,
-  routing→RabbitMQ, identity→the JWT). If an instance dies, the client reconnects to **any**
+  routing→Kafka, identity→the JWT). If an instance dies, the client reconnects to **any**
   other instance (no sticky sessions), re-CONNECTs, re-SUBSCRIBEs, and re-fetches recent
   history — nothing is lost. A message sent during the reconnect gap is missed on the socket
   but recovered from history, which is again why persist-first + Postgres-as-source-of-truth
-  matters. (Consumer queue topology to avoid the single-shared-queue "competing consumers"
-  trap is a CHAT-107 concern — each ws-gateway instance needs its own queue bound to the
-  exchange, handled by the STOMP broker relay, not one shared queue.)
+  matters. Kafka consumer groups allow ws-gateway pods to scale horizontally without a
+  per-pod queue-per-subscription topology.
 
 ### Message history pagination (applies to BOTH rooms CHAT-104 and DMs CHAT-105)
 Decided once, consistently. History is returned **bounded, newest-first, with an optional
@@ -404,16 +592,26 @@ concrete strings, event shapes, and trigger conditions so developer can implemen
 
 **Broker wiring recap (the constraint every decision below respects).** ws-gateway uses
 Spring's **in-memory simple broker** (`enableSimpleBroker("/topic")`, **not**
-`enableStompBrokerRelay` — the relay-per-subscription model is the rejected one). Each pod
-runs one RabbitMQ consumer on **its own broadcast queue** bound to exchange `chattera.events`
-with routing pattern **`room.#`**, so the pod receives *every* room event. The consumer
-republishes each event into the local simple broker via `SimpMessagingTemplate`; the simple
-broker's per-pod subscription registry **is** the "in-memory roomId→local-session map" from
-CHAT-24 §3 — developer does not hand-roll that map, Spring maintains it. ws-gateway never
-touches Postgres and never calls chat-service on the message hot path.
+`enableStompBrokerRelay` — the relay-per-subscription model is the rejected one). Every
+ws-gateway pod runs a Kafka consumer (`@KafkaListener(topicPattern = "chattera.events.*")`)
+that wildcard-subscribes to the shared `chattera.events.*` topic namespace and dispatches by
+payload type via `@KafkaHandler`. The consumer republishes each event into the local simple
+broker via `SimpMessagingTemplate`; the simple broker's per-pod subscription registry **is**
+the "in-memory roomId→local-session map" from CHAT-24 §3 — developer does not hand-roll that
+map, Spring maintains it. ws-gateway never touches Postgres and never calls chat-service on
+the message hot path.
 
-#### 1. STOMP destination naming
-- **Room and DM conversation stream — clients SUBSCRIBE to `/topic/rooms.{roomId}`.** This is
+  **Current caveat, tracked as CHAT-114, not fixed here.** This still assumes every pod sees
+  every event, which the earlier RabbitMQ broadcast-queue design guaranteed by construction.
+  The actual `KafkaEventPublisher`/`ChatteraMessagingProperties` wiring does not yet reproduce
+  that guarantee: it publishes each event to a distinct, auto-created topic per room per
+  event type (e.g. `chattera.events.room-message-created.<roomId>`) rather than a bounded,
+  partitioned topic set keyed by `roomId`/`userId`, and every ws-gateway pod currently shares
+  one Kafka consumer group id (`ws-gateway`) — which is the pattern for *splitting* partitions
+  across a group, not fanning the same event out to every member. At Sprint 1's single-pod
+  scale this is invisible; it must be resolved before CHAT-24's multi-pod ws-gateway design
+  (floor of ≥6 pods) is real. See §3 below and CHAT-114.
+
   the single delivery destination for *both* room messages and DMs. A DM is a room
   (`type='DIRECT'`, CHAT-105), so it reuses the exact same destination, event, routing key,
   and authz as any other room — there is **no** separate per-user `/user/queue/...` delivery
@@ -423,12 +621,13 @@ touches Postgres and never calls chat-service on the message hot path.
 - **What the client subscribes to.** On CONNECT the client fetches its room list over REST and
   SUBSCRIBEs to `/topic/rooms.{roomId}` for each room/DM it belongs to and wants live. Opening
   a new conversation adds one SUBSCRIBE.
-- **Consistency with the broadcast-queue topology.** The client-facing destination is a
-  simple-broker concept and is **decoupled** from the AMQP layer: the RabbitMQ side is a
-  single per-pod broadcast queue with a **catch-all `room.#` binding**, not a
-  binding-per-destination. Naming rooms `/topic/rooms.{roomId}` therefore does not create any
-  per-room broker binding — it only creates a per-session entry in the pod's in-memory simple
-  broker registry. This is exactly what keeps broker binding count at O(pods), per CHAT-24 §3.
+- **Consistency with the topic namespace.** The client-facing STOMP destination is a
+  simple-broker concept, fully decoupled from Kafka topic naming: naming rooms
+  `/topic/rooms.{roomId}` creates no Kafka topic or partition — it only creates a per-session
+  entry in the pod's in-memory simple broker registry. What the actual Kafka topic count looks
+  like (currently one topic per room per event type, per the caveat above) is a separate
+  concern from STOMP destination naming, and is the scaling gap tracked as CHAT-114 (§3), not
+  something the destination-naming scheme itself causes.
 - **Not-currently-subscribed conversations** (e.g. a brand-new DM opened by someone else after
   you connected) are picked up on the next room-list/history refetch, not pushed live. A
   dedicated real-time "new-conversation" nudge (FR-05 in-app notifications) is its **own**
@@ -447,34 +646,46 @@ best-effort/never-throws per that contract).
 `RoomMessageCreatedEvent`):**
 
 ```
-// Published by ws-gateway, consumed by chat-service. Routing key: receipt.delivered
+// Published by ws-gateway, consumed by chat-service. Topic: chattera.events.receipt.delivered
 MessageDeliveredEvent(UUID messageId, UUID roomId, String recipientId,
                       Instant deliveredAt, Instant occurredAt)
 
-// Published by ws-gateway, consumed by chat-service. Routing key: receipt.read
+// Published by ws-gateway, consumed by chat-service. Topic: chattera.events.receipt.read
 // messageId = the recipient's last-read message; chat-service applies "read up to" semantics.
 MessageReadEvent(UUID messageId, UUID roomId, String recipientId,
                  Instant readAt, Instant occurredAt)
 
 // Published by chat-service AFTER it persists a status change, consumed by ws-gateway.
-// Routing key: room.<roomId>  (same key family as messages, so it rides the same per-pod
-// broadcast queue and is delivered on /topic/rooms.{roomId} like any room event).
+// Topic: chattera.events.room-message-status-changed.<roomId> (same naming family as
+// RoomMessageCreatedEvent, covered by ws-gateway's chattera.events.* wildcard subscription
+// and delivered on /topic/rooms.{roomId} like any room event).
 // status is "DELIVERED" | "READ" (kept a String to avoid depending on chat-service's
 // MessageStatus enum from a shared module; documented allowed values).
 RoomMessageStatusChangedEvent(UUID messageId, UUID roomId, String status,
                               String recipientId, Instant occurredAt)
 ```
 
-**Routing keys / queues:**
-- ws-gateway publishes receipts with keys `receipt.delivered` / `receipt.read`.
-- **chat-service** adds a durable `@RabbitListener` queue (e.g. `chat.receipts`) bound to
-  `chattera.events` with pattern **`receipt.*`**. ws-gateway's broadcast queue binds `room.#`
-  (above) and therefore does **not** consume `receipt.*` — receipts are chat-service-only.
-- After chat-service persists, it publishes `RoomMessageStatusChangedEvent` with key
-  `room.<roomId>`, which ws-gateway pods pick up on their `room.#` broadcast queue and deliver
-  on `/topic/rooms.{roomId}` — so the **original sender** (subscribed to that topic) sees the
-  tick update live. This one extra hop applies only to low-volume, DM-only receipts, never to
-  the message hot path.
+**Topics and consumption:**
+- ws-gateway publishes receipts to `chattera.events.receipt.delivered` /
+  `chattera.events.receipt.read`.
+- **chat-service** consumes them via `ReceiptEventListener`
+  (`@KafkaListener(topicPattern = "chattera.events.*")`, `@KafkaHandler`-by-payload-type
+  dispatch). ws-gateway's own `RoomEventBroadcastListener` uses the identical wildcard
+  pattern, so both services' listeners are assigned every topic under the namespace,
+  including each other's event types — Spring's class-level `@KafkaHandler` dispatch throws
+  `KafkaException("No method found for <payload type>")` for any consumed record whose
+  payload type has no matching handler, so each listener declares a no-op
+  `@KafkaHandler(isDefault = true)` to absorb the event types it doesn't act on (e.g.
+  `ReceiptEventListener` no-ops on `RoomMessageCreatedEvent` and friends;
+  `RoomEventBroadcastListener` no-ops on `MessageDeliveredEvent`/`MessageReadEvent`). This is
+  a workable stopgap, not the target design — the real fix (narrower per-service topic
+  patterns instead of one shared wildcard) is the same shared-namespace root cause as the
+  rest of this section and remains tracked under CHAT-114.
+- After chat-service persists, it publishes `RoomMessageStatusChangedEvent` to
+  `chattera.events.room-message-status-changed.<roomId>`, which ws-gateway picks up on its
+  wildcard subscription and delivers on `/topic/rooms.{roomId}` — so the **original sender**
+  (subscribed to that topic) sees the tick update live. This one extra hop applies only to
+  low-volume, DM-only receipts, never to the message hot path.
 
 **Persistence rule (monotonic, idempotent).** chat-service advances status only, never
 downgrades, so out-of-order or duplicate receipts are safe:
@@ -572,8 +783,9 @@ that user's live subscription to the room. Chosen because:
   grows with the connection count we are explicitly trying to scale.
 - It is **architecturally consistent**: it reuses the exact persist-then-publish path chat-service
   already uses for `RoomMessageCreatedEvent`/`RoomMessageStatusChangedEvent`, the same
-  `room.<roomId>` routing-key family, the same per-pod `room.#` broadcast queue on ws-gateway,
-  and the same `@RabbitHandler`-by-type dispatch — **no new broker queue or binding**.
+  `chattera.events.room-membership-revoked.<roomId>` topic-naming family, the same wildcard
+  `chattera.events.*` subscription on ws-gateway, and the same `@KafkaHandler`-by-type dispatch
+  — **no new topic or consumer configuration required**.
 - It revokes in **broker-latency time (sub-second)** rather than up to ~60 s.
 
 **New shared event (add to `common-domain`, a record implementing `DomainEvent`, mirroring
@@ -583,9 +795,10 @@ that user's live subscription to the room. Chosen because:
 // Published by chat-service after a user's membership in a room ends (self-leave now;
 // owner-removal when that endpoint is added). Consumed by ws-gateway, which force-drops
 // that user's live subscription to /topic/rooms.{roomId}.
-// Routing key: room.<roomId> — same family as RoomMessageCreatedEvent, so it rides the
-// existing per-pod broadcast queue (room.# binding); every pod receives it, and only the
-// pod(s) holding that user's socket act on it.
+// Topic: chattera.events.room-membership-revoked.<roomId> — same naming family as
+// RoomMessageCreatedEvent, delivered via ws-gateway's existing chattera.events.* wildcard
+// subscription; every pod receives it, and only the pod(s) holding that user's socket act
+// on it.
 RoomMembershipRevokedEvent(UUID roomId, String userId, Instant occurredAt)
 ```
 
@@ -594,13 +807,13 @@ membership)` and still inside the `@Transactional` method, publish a Spring appl
 `applicationEventPublisher.publishEvent(new RoomMembershipRevokedEvent(roomId, userId, Instant.now()))`
 (inject `ApplicationEventPublisher` exactly as `MessageService` does). Add a
 `@TransactionalEventListener(phase = AFTER_COMMIT)` handler to `ChatEventListener` that calls
-`eventPublisher.publish("room." + event.roomId(), event)`. AFTER_COMMIT is required so a
+`eventPublisher.publish("room-membership-revoked." + event.roomId(), event)`. AFTER_COMMIT is required so a
 rolled-back leave never emits a phantom revoke — identical to the message/receipt path. Notes:
 - The OWNER-leave auto-transfer promotes a new owner, but only the **leaver** is revoked (single
   `userId`); the promoted owner keeps their subscription. Correct as-is.
 - A future owner-remove-member endpoint MUST publish the same event for the removed `userId`.
 
-**Consume side (ws-gateway).** Add a `@RabbitHandler` to `RoomEventBroadcastListener` for
+**Consume side (ws-gateway).** Add a `@KafkaHandler` to `RoomEventBroadcastListener` for
 `RoomMembershipRevokedEvent`. Unlike the message/status handlers it **must NOT `convertAndSend`
 the event to `/topic/rooms.{roomId}`** (that would fan a revoke out to every subscriber); it
 targets only the revoked user's own subscription(s):
@@ -654,7 +867,7 @@ UNSUBSCRIBE above is preferred; socket-close is an acceptable fallback, not the 
 ## Scalability & High-Availability Architecture (CHAT-24)
 This is the real scalability/HA design for the system as actually built (Java 21 / Spring
 Boot 3.5.x; gateway, ws-gateway, profile-service, chat-service, file-service; single-instance
-PostgreSQL / Redis / RabbitMQ / Keycloak; docker-compose only, nothing deployed to any cloud).
+PostgreSQL / Redis / Kafka / Keycloak; docker-compose only, nothing deployed to any cloud).
 It **supersedes** the earlier "Known limits / scaling considerations" placeholder that lived
 here (that section recorded the problems; this section decides them).
 
@@ -708,7 +921,9 @@ pipeline that builds/ships these images; this section owns the *shape*.
 
   writes/reads ─> PgBouncer ─> PostgreSQL (per-service cluster: primary + replica(s), multi-AZ)
   presence/cache ─> Redis (managed HA / Cluster, multi-AZ)
-  events ─> RabbitMQ (3-node cluster, multi-AZ) ── one broadcast queue per ws-gateway pod
+  events ─> Kafka (3-broker cluster, multi-AZ, replication factor 3) ── every ws-gateway pod
+            wildcard-subscribes to the shared chattera.events.* namespace (CHAT-114 tracks
+            the topic-count/consumer-group fixes needed for this to fan out correctly)
   files ─> cloud object storage (GCS/S3) via presigned URLs (MinIO is dev-only)
 ```
 
@@ -749,7 +964,7 @@ probe groups and wire them:
 piece of transient per-instance state in the system. The design already established for
 CHAT-107 holds and is what makes this tractable; scaling it is mostly *operational*:
 - **No sticky sessions.** A socket is transient, not authoritative (history→Postgres,
-  presence→Redis, routing→RabbitMQ, identity→JWT). A client can (re)connect to **any** pod,
+  presence→Redis, routing→Kafka, identity→JWT). A client can (re)connect to **any** pod,
   re-CONNECT / re-SUBSCRIBE / re-fetch recent history, and lose nothing. **This does not
   change at scale** and is the property that makes ws-gateway horizontally scalable and
   drain-safe.
@@ -849,60 +1064,67 @@ across multiple chat Postgres clusters by `hash(room_id)`** (a room's history st
 one shard; the app routes by room). This is a genuinely larger change and is **deferred with a
 trigger** (write-IOPS on the chat primary as the observed ceiling), not designed here.
 
-### 3. Messaging backbone scaling — decided: broadcast-queue-per-instance + app-side filtering
-The recorded soft ceiling was **RabbitMQ queue/binding count** under the Sprint-1/CHAT-107
-STOMP-broker-relay topology, which creates a broker queue/binding **per subscription**: with
-millions of live room subscriptions that is millions of bindings — RabbitMQ's known failure
-mode. Decision for scale:
+### 3. Messaging backbone scaling — Kafka topic/consumer-group topology (gap tracked as CHAT-114)
+The event backbone is Kafka (see "Event bus decision — Kafka" above); the soft ceiling this
+section originally protected against — RabbitMQ queue/binding count exploding to one binding
+per live room subscription under a naive STOMP-broker-relay topology — no longer applies to
+the broker itself. The same **shape** of problem re-appears one layer down, in how chat-service
+and ws-gateway actually use Kafka today, and is tracked as its own backlog ticket (CHAT-114)
+rather than fixed in this pass.
 
 **Why the obvious mitigations don't apply here.** You cannot partition ws-gateway by room
-(consistent-hash exchange, room→instance affinity, cellular-by-room): a single user holds **one
+(consistent-hash routing, room→instance affinity, cellular-by-room): a single user holds **one
 socket** but subscribes to **many** rooms, so that user's pod must be able to receive events
 for *any* of their rooms. Given non-sticky, one-socket-per-user, **every ws-gateway pod must be
 able to receive any room's event.** That rules out room-sharding the delivery tier at this
-tier and points to a single answer.
+tier and points to a single answer: every pod consumes the full event stream and filters
+locally against its own socket registry.
 
-**Chosen topology (supersedes STOMP-relay-per-subscription):**
-- **Producers are unchanged.** chat-service still publishes `RoomMessageCreated` with routing
-  key `room.<roomId>` to the single durable topic exchange `chattera.events`, through the
-  `EventPublisher` abstraction. This is exactly the "contained, not a rewrite" payoff — the
-  write side does not move.
-- **One durable-definition, transient queue per ws-gateway pod**, bound to `chattera.events`
-  broadcast (`room.*` / `#`). Each pod consumes **all** room events and does **app-side
-  routing**: it keeps an in-memory `roomId → local socket sessions` map and forwards an event
-  only to the sockets it actually holds for that room, discarding the rest. This caps broker
-  **queue + binding count at O(ws-gateway pods)** — tens/hundreds, bounded — instead of
-  O(subscriptions). The binding-explosion ceiling is gone.
-- **Queues are transient/non-mirrored (cheap).** Because Postgres is the source of truth and a
-  dropped event is recovered by reconnect + history refetch, per-pod queues need no
-  durability/mirroring; only the **exchange** definition is durable. A broker node failure just
-  makes each pod redeclare its queue on a surviving node.
-- **The new ceiling, named honestly:** since every pod sees every message, per-pod
-  event-processing load equals the *total system publish rate* (**not** the post-fanout push
-  rate — fanout is applied locally per pod to its own sockets). Adding ws-gateway pods does
-  **not** reduce that consume load (it only adds socket capacity). That is a real ceiling — but
-  a far higher, more predictable one than millions of bindings, and it is a cheap hashmap-filter
-  per event.
+**What is actually built today.** `KafkaEventPublisher` (via `ChatteraMessagingProperties`)
+publishes each event to a distinct, broker-auto-created topic per room per event type — e.g.
+`chattera.events.room-message-created.<roomId>`, `chattera.events.room-message-status-
+changed.<roomId>`, `chattera.events.room-membership-revoked.<roomId>` — with no partition key
+set. Producer (`ChatEventListener`) and consumers (`RoomEventBroadcastListener`,
+`ReceiptEventListener`) all go through the `EventPublisher` abstraction, which is exactly the
+"contained, not a rewrite" payoff this section originally banked on: the write side and the
+abstraction seam don't move regardless of what's decided below. Consumers wildcard-subscribe
+with `@KafkaListener(topicPattern = "chattera.events.*")` and dispatch by payload type via
+`@KafkaHandler` — the Kafka-native analogue of the app-side hashmap filtering the earlier
+RabbitMQ broadcast-queue design used.
 
-**Validated against CHAT-110 (flag 1).** The binding-count concern is **fully removed** by this
-topology, independent of room count: CHAT-110 computed ~**7,000 concurrently-active rooms**, but
-because bindings are per-*pod* (broadcast queue + `#` binding), not per-room/per-subscription,
-the broker binding count is **O(ws-gateway pods) ≈ tens** regardless of whether active rooms are
-7,000 or 700,000. The "thousands–tens of thousands active rooms safe zone" from the old Known-
-limits note is satisfied with enormous margin. On throughput: each pod's broadcast queue must
-consume the **publish** rate — **~400 events/sec sustained, ~2,000/sec burst** — which a single
-RabbitMQ consumer + in-memory hashmap filter handles trivially (that is one to two orders of
-magnitude below what a single AMQP consumer sustains). Note the ~1,200 sustained / 3,000–6,000
-burst *WS push* events/sec figure is the **post-fanout** number and is spread across all pods'
-local sockets; it does **not** land on any single pod's broadcast queue, so it does not move the
-per-pod-queue ceiling.
+**Where this diverges from the "every pod sees every event, O(pods) not O(rooms)" goal:**
+- **Topic count is O(rooms × event types), not O(pods).** The RabbitMQ design's entire point
+  was capping broker object count at the pod count regardless of room count. The current
+  per-room-topic scheme inverts that: at CHAT-110's ~7,000 concurrently-active rooms this is
+  already tens of thousands of topics, and Kafka clusters have a practical ceiling on total
+  topic/partition count (typically low thousands per broker) long before 1,000,000 users' worth
+  of rooms exist. This is the same failure mode the earlier binding-count analysis was written
+  to avoid, now reappearing on the Kafka side.
+- **The shared `ws-gateway` consumer group id breaks the fan-out guarantee at more than one
+  pod.** Kafka consumer groups exist to *split* partitions across members, not to broadcast the
+  same message to every member. Every ws-gateway pod is currently registered under the same
+  group id (`ws-gateway`, see `application.yml`), so scaling past one pod does not reproduce the
+  "every pod receives every event" property this whole section depends on — it does the
+  opposite. At Sprint 1's single-pod scale this is invisible; it becomes a correctness bug (some
+  pods silently miss events for rooms they hold sockets for) the moment ws-gateway runs with
+  `replicas > 1`, which CHAT-24 §1 requires (floor of ≥6 pods).
 
-**Kafka-escalation trigger — now a concrete number (was vague).** Adopt Kafka (per below) when
-the **sustained per-pod broadcast consume rate approaches ~10,000 events/sec** — roughly **5× the
-2,000/sec burst target / ~25× the 400/sec sustained target**, i.e. a 5×–25× growth in
-system-wide message publish rate beyond the 1M-user CHAT-110 targets. Below that, a single
-consumer's hashmap filter is not the bottleneck and RabbitMQ stays. This gives a monitored,
-alertable threshold (export per-pod broadcast-consume rate) rather than "evaluate later."
+**Target design (tracked as CHAT-114, not built in this pass).** A small, fixed set of Kafka
+topics — one per event *type*, not per room — partitioned by `roomId`/`userId` as the Kafka
+message key, combined with a fan-out-safe consumer strategy per pod (a unique consumer group id
+per ws-gateway pod, or Kafka's manual partition-assignment API, so every pod's consumer receives
+every partition rather than one slice of them). That reproduces the RabbitMQ broadcast-queue
+property — topic/partition count bounded by event-type count, not room count, and consume load
+per pod equal to the full publish rate — without reintroducing per-room broker objects.
+`DomainEvent` gaining a `partitionKey()` method (→ `roomId`) is the concrete first step.
+
+**Validated against CHAT-110.** Once on a bounded topic set, each pod's consume rate is the same
+**~400 events/sec sustained, ~2,000/sec burst** figure this section already sized for, which a
+single Kafka consumer handles trivially (one to two orders of magnitude below what a single
+consumer sustains). The ~1,200 sustained / 3,000–6,000 burst *WS push* events/sec figure remains
+the **post-fanout** number, spread across all pods' local sockets — it does not land on any
+single pod's consume path. The ceiling this section actually cares about is topic/partition
+count and per-pod fan-out correctness (CHAT-114 above), not raw throughput.
 
 **Design-time risk — unbounded room membership (CHAT-110 flag 2, recorded not mitigated).**
 CHAT-104 shipped with **no cap on room membership**, and every fanout number here assumes the
@@ -910,11 +1132,11 @@ CHAT-110 average room size of ~6–8. A single viral/uncapped room breaks that b
 magnitude: one `RoomMessageCreated` for a 50,000-member room becomes a **50,000-way push burst**
 from a *single* consumed event. **Whether to cap membership is a product decision (business-
 analyst / PM), not the architect's to set** — but its impact on *this* design is on record:
-- **What the topology does well:** the broadcast-queue design already **distributes** mega-room
-  fanout the right way — each pod pushes only to the mega-room sockets it locally holds, so the
-  50k pushes are spread across the whole ws-gateway fleet rather than concentrated on one pod.
-  The broker/consume side is unaffected (still one event per message). So the failure is **not**
-  a broker or binding failure.
+- **What the topology does well:** the per-pod local-filtering design already **distributes**
+  mega-room fanout the right way — each pod pushes only to the mega-room sockets it locally
+  holds, so the 50k pushes are spread across the whole ws-gateway fleet rather than concentrated
+  on one pod. The broker/consume side is unaffected (still one event per message). So the
+  failure is **not** a broker or topic/partition failure.
 - **Where it concretely gets worse and there is no guard today:** the per-pod **outbound** path
   has **no backpressure or circuit-breaker**. A mega-room message spike can saturate a pod's
   socket-write capacity and inflate p95 delivery latency past the 500 ms budget for *all* users
@@ -928,18 +1150,11 @@ analyst / PM), not the architect's to set** — but its impact on *this* design 
   membership cap and/or this bounded-queue guard exist, an uncapped mega-room is an accepted,
   documented failure mode of this design, not a handled one.**
 
-**Broker HA:** RabbitMQ as a **3-node cluster, multi-AZ**. Any *durable* queue we add later
-uses **quorum queues**; the ws-gateway broadcast queues stay transient per above.
-
-**Kafka is now the named, conditional escalation (not a re-listing of options).** *If* total
-broadcast throughput exceeds what one ws-gateway pod can filter, the substrate — not just the
-tuning — has to change, and the chosen replacement is **Kafka**: independent consumer groups
-give exactly the "every pod receives everything" fan-out natively, a slow/restarting pod simply
-resumes from its offset (no lost-while-down), and partitions add producer/throughput
-parallelism. The `EventPublisher` abstraction keeps that producer swap contained. **Decision:
-stay on RabbitMQ with the broadcast-queue topology for this pass** (it removes the actual
-ceiling — binding count — while keeping the existing stack and DX); **adopt Kafka only on the
-per-pod-throughput trigger.** This is a real decision with a condition, not "evaluate later."
+**Broker HA:** Kafka as a **3-broker cluster, multi-AZ**, replication factor **3** with
+`min.insync.replicas=2` for topics that need durability guarantees. The per-room-per-event-type
+topics from today's implementation are individually cheap/uncritical (Postgres remains the
+source of truth for durable state), but their *count* is exactly the CHAT-114 concern above —
+a topology problem, not a durability one.
 
 ### 4. Keycloak scaling
 Keycloak load is driven by **login/token-issuance/refresh rate**, not request rate — Chattera
@@ -1000,7 +1215,7 @@ read-your-writes (§2.3).
 | Load balancers | managed cloud L7 LBs | inherently multi-AZ, no action |
 | PostgreSQL (per service) | primary + replica(s) multi-AZ, automatic failover (managed HA / Patroni) | promote replica; PgBouncer reconnects |
 | PgBouncer | pooled Deployment / managed pooler | multiple instances, no single pooler |
-| RabbitMQ | 3-node cluster multi-AZ; quorum queues for durable, transient per-pod queues redeclared on survivor | pod redeclares its broadcast queue on a live node |
+| Kafka | 3-broker cluster multi-AZ, replication factor 3, `min.insync.replicas=2` | partition leader re-election on broker loss; producers/consumers reconnect automatically |
 | Keycloak | 3 nodes, replicated Infinispan, multi-AZ, HA DB | any node serves; sessions replicated |
 | Redis | managed HA / Sentinel / Cluster + replicas, multi-AZ | auto-failover; presence self-heals via TTL+heartbeat |
 | Object storage | cloud object storage (GCS/S3), inherently multi-AZ durable | MinIO is **dev-only**; prod swaps to the managed store |
@@ -1024,11 +1239,12 @@ rewrite" thesis proven out):**
   backing store swaps MinIO→cloud object storage.
 
 **Needs rework / net-new:**
-- **ws-gateway consumer topology:** STOMP-relay-per-subscription → **broadcast queue per pod +
-  app-side room→session filtering** (§3). Contained to ws-gateway consumer wiring (CHAT-107).
+- **ws-gateway consumer topology:** STOMP-relay-per-subscription → **Kafka wildcard
+  subscription + app-side room→session filtering**, with the topic-count and consumer-group
+  fixes tracked under CHAT-114 (§3). Contained to ws-gateway consumer wiring (CHAT-107).
 - **PostgreSQL:** single instance → **instance-per-service + PgBouncer + read replicas +
   RANGE-partitioned `messages`** (§2).
-- **RabbitMQ / Redis / Keycloak:** single instance → **clustered/HA** (§3/§5/§4).
+- **Kafka / Redis / Keycloak:** single instance → **clustered/HA** (§3/§5/§4).
 - **Net-new platform:** managed **load balancers**, **Kubernetes** orchestration, **HPA/KEDA**,
   **liveness/readiness probes + graceful shutdown**, autoscaling metrics/exporters, and the
   MinIO→cloud-object-storage swap. None of these exist today.
@@ -1036,11 +1252,11 @@ rewrite" thesis proven out):**
 ### 8. Explicitly still deferred (with triggers)
 - **Multi-region / active-active / DR.** Out of scope for this pass; target is single-region
   multi-AZ HA. Multi-region adds cross-region Postgres replication, Keycloak cross-site
-  Infinispan, Redis/RabbitMQ federation, object-storage geo-replication, and a global/DNS LB —
-  a separate epic. Trigger: a latency-for-distant-users or regional-DR requirement from
-  product.
-- **ws-gateway cellular sharding by room.** Only relevant if the per-pod broadcast-throughput
-  ceiling (§3) is hit *and* Kafka doesn't buy enough headroom. Genuinely complex (a user spans
+  Infinispan, Redis/Kafka cross-region replication (e.g. MirrorMaker 2), object-storage
+  geo-replication, and a global/DNS LB — a separate epic. Trigger: a latency-for-distant-users
+  or regional-DR requirement from product.
+- **ws-gateway cellular sharding by room.** Only relevant if per-pod consume throughput becomes
+  the ceiling even after the CHAT-114 topic/consumer-group fix. Genuinely complex (a user spans
   rooms across cells). Deferred with the throughput trigger.
 - **Sharding `messages` across multiple chat DB clusters by `hash(room_id)`** (§2). Deferred
   with the chat-primary write-IOPS trigger.
@@ -1048,15 +1264,15 @@ rewrite" thesis proven out):**
   thresholds, node counts).~~ **Landed and reconciled** against performance-engineer's CHAT-110
   targets (2026-07-27) — folded into §§1–5 as concrete values (per-pod socket ceiling ~20k;
   HPA CPU ~65% / ws-conn ~70%; chat +2 / profile +1 replicas; daily `messages` partitions;
-  Hikari ~10 behind PgBouncer ~50–100 server conns; Kafka trigger ~10k events/sec/pod). No
-  longer deferred. Remaining true unknowns are **load-test-confirmed** ceilings (validate the
-  ~20k socket and ~10k-event/sec figures under soak), not undesigned decisions.
+  Hikari ~10 behind PgBouncer ~50–100 server conns). No longer deferred. Remaining true
+  unknowns are **load-test-confirmed** ceilings (validate the ~20k socket figure under soak,
+  and the CHAT-114 topic/consumer-group fix once built), not undesigned decisions.
 
 ### 9. Delivery / handoffs
 This is buildable now. Suggested breakdown for scrum-master to ticket under the CHAT-24 epic
 (sequence roughly: platform first, then per-component HA, then the topology change):
 - **devops-engineer:** Kubernetes cluster + IaC; the three L7 LBs (REST/WS/auth) with WS-upgrade
-  + draining on `ws.chattera`; managed HA PostgreSQL (per service) + PgBouncer; RabbitMQ 3-node
+  + draining on `ws.chattera`; managed HA PostgreSQL (per service) + PgBouncer; Kafka 3-broker
   cluster; managed HA Redis; Keycloak 3-node Infinispan cluster; MinIO→cloud object storage;
   probe/metric scrape wiring. Depends on CHAT-108 (pipeline) landing first.
 - **developer:** liveness/readiness health groups + `server.shutdown=graceful` per service;
@@ -1064,14 +1280,16 @@ This is buildable now. Suggested breakdown for scrum-master to ticket under the 
   prepared-statement setting for PgBouncer transaction mode (§2.2); **explicit
   `spring.datasource.hikari.*` pool block per service (~10) replacing the inherited default
   (§2.2, CHAT-110 flag 3)**; `messages` **daily** RANGE-partition Flyway migration + pg_partman
-  (§2, do early); ws-gateway broadcast-queue consumer + in-memory room→session router replacing
-  the STOMP-relay-per-subscription wiring (§3, CHAT-107 area); ws-gateway active-connection-count
-  and per-pod broadcast-consume-rate metrics for HPA + the Kafka trigger; **bounded per-socket
-  outbound queue with drop-and-mark-stale backpressure (§3 mega-room risk, CHAT-110 flag 2) —
-  follow-up ticket.**
+  (§2, do early); **CHAT-114 (Kafka topology fix): add `partitionKey()` to `DomainEvent`
+  (→ `roomId`); collapse the current per-room-per-event-type topics into a bounded,
+  per-event-type topic set; give each ws-gateway pod a fan-out-safe consumer identity (unique
+  group id per pod, or manual partition assignment) instead of the shared `ws-gateway` group
+  id** (§3); ws-gateway active-connection-count and per-pod consume-rate metrics for HPA;
+  **bounded per-socket outbound queue with drop-and-mark-stale backpressure (§3 mega-room risk,
+  CHAT-110 flag 2) — follow-up ticket.**
 - **performance-engineer:** the concurrency/throughput/latency/availability targets that turn
-  every "tunable" above into a number; load-test the per-pod socket and broadcast-throughput
-  ceilings that gate §1 and the RabbitMQ→Kafka trigger in §3.
+  every "tunable" above into a number; load-test the per-pod socket ceiling that gates §1, and
+  validate the CHAT-114 topic/consumer-group fix in §3 once built.
 - **Reconcile:** ~~when performance-engineer's numbers land, revisit HPA thresholds, replica
   counts, partition interval, and the §3 Kafka trigger.~~ **Done 2026-07-27** against CHAT-110 —
   see the "Reconciled against performance-engineer's CHAT-110 targets" callout at the top of this

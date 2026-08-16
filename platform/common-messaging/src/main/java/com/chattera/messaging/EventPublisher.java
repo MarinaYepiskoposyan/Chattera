@@ -4,9 +4,7 @@ import com.chattera.domain.event.DomainEvent;
 
 /**
  * Publisher-side contract for the Chattera messaging backbone. The concrete
- * transport is RabbitMQ via Spring AMQP (decided CHAT-104, see
- * solution-architecture.md "Event bus decision"; {@code RabbitEventPublisher}
- * in this module is the implementation), but producers (chat-service,
+ * transport is Kafka via Spring for Apache Kafka, but producers (chat-service,
  * file-service) are written against this abstraction rather than the broker
  * API directly so the transport can change later without touching call sites.
  *

@@ -3,27 +3,31 @@ package com.chattera.messaging;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 
 /**
- * Configuration for the shared RabbitMQ event bus, bound from
- * {@code chattera.messaging.*}. One topic exchange is shared by every
- * producer; individual events are distinguished by the routing key each
- * caller passes to {@link EventPublisher#publish}, not by separate
- * exchanges.
+ * Configuration for the shared Kafka event bus, bound from
+ * {@code chattera.messaging.*}. All Chattera producers publish into a shared
+ * topic namespace; callers supply the logical topic name to
+ * {@link EventPublisher#publish}, and the prefix is added automatically.
  */
 @ConfigurationProperties(prefix = "chattera.messaging")
 public class ChatteraMessagingProperties {
 
     /**
-     * Name of the durable topic exchange every Chattera producer publishes
-     * to. Consumers (e.g. ws-gateway in CHAT-107) bind their own
-     * queues to this exchange with a routing-key pattern.
+     * Shared topic namespace prefix for all Chattera events.
      */
-    private String exchange = "chattera.events";
+    private String topicPrefix = "chattera.events";
 
-    public String getExchange() {
-        return exchange;
+    public String getTopicPrefix() {
+        return topicPrefix;
     }
 
-    public void setExchange(String exchange) {
-        this.exchange = exchange;
+    public void setTopicPrefix(String topicPrefix) {
+        this.topicPrefix = topicPrefix;
+    }
+
+    public String resolveTopic(String topic) {
+        if (topic == null || topic.isBlank()) {
+            return topicPrefix;
+        }
+        return topic.startsWith(topicPrefix) ? topic : topicPrefix + "." + topic;
     }
 }

@@ -13,8 +13,8 @@ import com.chattera.domain.event.RoomMessageStatusChangedEvent;
 
 /**
  * Applies the delivered/read receipt write-back that {@code ReceiptEventListener}
- * (the {@code receipt.*} RabbitMQ consumer) receives from ws-gateway. See
- * solution-architecture.md "Real-time delivery - CHAT-107 implementation
+ * (the Kafka consumer for room-scoped receipt events) receives from ws-gateway.
+ * See solution-architecture.md "Real-time delivery - CHAT-107 implementation
  * decisions" §2 - status only ever advances (monotonic/idempotent), and a
  * {@link RoomMessageStatusChangedEvent} is published (mirroring
  * {@code MessageService}'s persist-then-publish pattern via

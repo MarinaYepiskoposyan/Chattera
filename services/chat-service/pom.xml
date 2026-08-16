@@ -18,7 +18,7 @@
   <description>
     Room and private messaging workflows: create/join/leave rooms, post
     messages, and fetch paginated history over REST, persisted to Postgres
-    and published (best-effort, after commit) to the RabbitMQ event bus.
+    and published (best-effort, after commit) to the Kafka event bus.
     CHAT-104. Real-time delivery (WebSocket consumer side) is CHAT-107, not
     built here.
   </description>

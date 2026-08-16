@@ -36,11 +36,17 @@ spring:
     schemas: chat_service
     create-schemas: true
 
-  rabbitmq:
-    host: ${SPRING_RABBITMQ_HOST:localhost}
-    port: ${SPRING_RABBITMQ_PORT:5672}
-    username: ${SPRING_RABBITMQ_USERNAME:chattera}
-    password: ${SPRING_RABBITMQ_PASSWORD:changeme_rabbitmq_dev_password}
+  kafka:
+    bootstrap-servers: ${SPRING_KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      auto-offset-reset: earliest
+      properties:
+        spring.json.trusted.packages: "com.chattera.domain.event"
 
   security:
     oauth2:
@@ -64,10 +70,10 @@ management:
       probes:
         enabled: true
   health:
-    # RabbitMQ is transient delivery, not the source of truth (Postgres is -
+    # Kafka is transient delivery, not the source of truth (Postgres is -
     # see solution-architecture.md "The bus is transient delivery"): a
     # publish failure is logged and must never fail the REST write, so a
     # broker outage must not flip chat-service's liveness/readiness to DOWN
     # either - REST + history remain fully functional without it.
-    rabbit:
+    kafka:
       enabled: false
