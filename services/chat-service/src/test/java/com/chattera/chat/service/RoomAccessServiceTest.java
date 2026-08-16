@@ -16,6 +16,7 @@ import com.chattera.chat.domain.RoomRole;
 import com.chattera.chat.domain.RoomType;
 import com.chattera.chat.repository.RoomMemberRepository;
 import com.chattera.chat.repository.RoomRepository;
+import com.chattera.chat.service.exception.NotRoomMemberException;
 import com.chattera.chat.service.exception.RoomNotFoundException;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -74,5 +75,24 @@ class RoomAccessServiceTest {
 
         assertThatThrownBy(() -> roomAccessService.requireSelfMembership(roomId, "outsider"))
                 .isInstanceOf(RoomNotFoundException.class);
+    }
+
+    /**
+     * CHAT-105 AC-12: requireMembership's non-member 403 path (unlike
+     * requireSelfMembership above, this is the ordinary post/read/leave
+     * check) confirmed against a DIRECT room specifically, not just PUBLIC -
+     * requireMembership never inspects {@code room.getType()}, but that was
+     * previously only established by inspection, not by an actual DIRECT
+     * room instantiation.
+     */
+    @Test
+    void requireMembershipThrowsNotRoomMemberForANonParticipantOfADirectRoom() {
+        UUID roomId = UUID.randomUUID();
+        Room room = new Room(roomId, null, RoomType.DIRECT, "subA", Instant.now(), "subA:subB");
+        when(roomRepository.findById(roomId)).thenReturn(Optional.of(room));
+        when(roomMemberRepository.findByRoomIdAndUserId(roomId, "outsider")).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> roomAccessService.requireMembership(roomId, "outsider"))
+                .isInstanceOf(NotRoomMemberException.class);
     }
 }

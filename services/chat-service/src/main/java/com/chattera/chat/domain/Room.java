@@ -38,16 +38,30 @@ public class Room {
     @Column(name = "created_at", nullable = false, updatable = false)
     private Instant createdAt;
 
+    /**
+     * {@code DIRECT}-room-only (CHAT-105): the two participants' Keycloak
+     * {@code sub}s in canonical sorted order ({@code min(a,b) + ":" + max(a,b)}),
+     * enforced unique at the DB level so at most one DM room exists per pair.
+     * Null for {@code PUBLIC}/{@code PRIVATE} rooms.
+     */
+    @Column(name = "direct_key", updatable = false, length = 511)
+    private String directKey;
+
     protected Room() {
         // required by JPA
     }
 
     public Room(UUID id, String name, RoomType type, String createdBy, Instant createdAt) {
+        this(id, name, type, createdBy, createdAt, null);
+    }
+
+    public Room(UUID id, String name, RoomType type, String createdBy, Instant createdAt, String directKey) {
         this.id = id;
         this.name = name;
         this.type = type;
         this.createdBy = createdBy;
         this.createdAt = createdAt;
+        this.directKey = directKey;
     }
 
     public UUID getId() {
@@ -68,5 +82,9 @@ public class Room {
 
     public Instant getCreatedAt() {
         return createdAt;
+    }
+
+    public String getDirectKey() {
+        return directKey;
     }
 }

@@ -39,4 +39,10 @@ public interface RoomRepository extends JpaRepository<Room, UUID> {
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("SELECT r FROM Room r WHERE r.id = :id")
     Optional<Room> findByIdForUpdate(@Param("id") UUID id);
+
+    /**
+     * Looks up a {@code DIRECT} room by its canonical (sorted) participant
+     * pair - see {@code RoomService.findOrCreateDirect} (CHAT-105).
+     */
+    Optional<Room> findByDirectKey(String directKey);
 }

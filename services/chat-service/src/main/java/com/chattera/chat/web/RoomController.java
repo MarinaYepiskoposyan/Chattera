@@ -17,7 +17,9 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
+import com.chattera.chat.service.DirectRoomOutcome;
 import com.chattera.chat.service.RoomService;
+import com.chattera.chat.web.dto.CreateDirectRoomRequest;
 import com.chattera.chat.web.dto.CreateRoomRequest;
 import com.chattera.chat.web.dto.RoomResponse;
 
@@ -39,6 +41,20 @@ public class RoomController {
     @ResponseStatus(HttpStatus.CREATED)
     public RoomResponse createRoom(@AuthenticationPrincipal Jwt jwt, @Valid @RequestBody CreateRoomRequest request) {
         return RoomResponse.of(roomService.createRoom(jwt.getSubject(), request));
+    }
+
+    /**
+     * Find-or-create a DIRECT room between the caller and {@code userId}
+     * (CHAT-105). Status code signals which happened: {@code 201 Created}
+     * when a new room was created, {@code 200 OK} when an existing DM was
+     * found - see {@code RoomService.findOrCreateDirect}.
+     */
+    @PostMapping("/direct")
+    public ResponseEntity<RoomResponse> createDirectRoom(
+            @AuthenticationPrincipal Jwt jwt, @Valid @RequestBody CreateDirectRoomRequest request) {
+        DirectRoomOutcome outcome = roomService.findOrCreateDirect(jwt.getSubject(), request.userId());
+        HttpStatus status = outcome.created() ? HttpStatus.CREATED : HttpStatus.OK;
+        return ResponseEntity.status(status).body(RoomResponse.of(outcome.roomWithMembership()));
     }
 
     /**

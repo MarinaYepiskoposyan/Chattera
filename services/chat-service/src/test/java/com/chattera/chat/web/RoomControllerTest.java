@@ -20,9 +20,11 @@ import com.chattera.chat.domain.Room;
 import com.chattera.chat.domain.RoomRole;
 import com.chattera.chat.domain.RoomType;
 import com.chattera.chat.error.GlobalExceptionHandler;
+import com.chattera.chat.service.DirectRoomOutcome;
 import com.chattera.chat.service.RoomService;
 import com.chattera.chat.service.RoomWithMembership;
 import com.chattera.chat.service.exception.RoomNotSelfJoinableException;
+import com.chattera.chat.service.exception.SelfDmNotAllowedException;
 import com.chattera.security.JwtAuthenticationConverterAutoConfiguration;
 
 import static org.mockito.ArgumentMatchers.any;
@@ -124,6 +126,69 @@ class RoomControllerTest {
         mockMvc.perform(post("/rooms/" + roomId + "/join").with(jwt().jwt(builder -> builder.subject("user-2"))))
                 .andExpect(status().isForbidden())
                 .andExpect(jsonPath("$.code").value("ROOM_NOT_SELF_JOINABLE"));
+    }
+
+    @Test
+    void createDirectRoomReturns201WhenANewRoomWasCreated() throws Exception {
+        UUID roomId = UUID.randomUUID();
+        Room room = new Room(roomId, null, RoomType.DIRECT, "user-1", Instant.parse("2026-01-01T00:00:00Z"));
+        when(roomService.findOrCreateDirect("user-1", "user-2"))
+                .thenReturn(new DirectRoomOutcome(new RoomWithMembership(room, RoomRole.MEMBER), true));
+
+        mockMvc.perform(post("/rooms/direct")
+                        .with(jwt().jwt(builder -> builder.subject("user-1")))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"userId\":\"user-2\"}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.type").value("DIRECT"))
+                .andExpect(jsonPath("$.name").doesNotExist())
+                .andExpect(jsonPath("$.member").value(true))
+                .andExpect(jsonPath("$.role").value("MEMBER"));
+    }
+
+    @Test
+    void createDirectRoomReturns200WhenAnExistingRoomWasFound() throws Exception {
+        UUID roomId = UUID.randomUUID();
+        Room room = new Room(roomId, null, RoomType.DIRECT, "user-1", Instant.parse("2026-01-01T00:00:00Z"));
+        when(roomService.findOrCreateDirect("user-2", "user-1"))
+                .thenReturn(new DirectRoomOutcome(new RoomWithMembership(room, RoomRole.MEMBER), false));
+
+        mockMvc.perform(post("/rooms/direct")
+                        .with(jwt().jwt(builder -> builder.subject("user-2")))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"userId\":\"user-1\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.id").value(roomId.toString()));
+    }
+
+    @Test
+    void createDirectRoomRejectsSelfDm() throws Exception {
+        when(roomService.findOrCreateDirect("user-1", "user-1")).thenThrow(new SelfDmNotAllowedException());
+
+        mockMvc.perform(post("/rooms/direct")
+                        .with(jwt().jwt(builder -> builder.subject("user-1")))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"userId\":\"user-1\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("SELF_DM_NOT_ALLOWED"));
+    }
+
+    @Test
+    void createDirectRoomRejectsABlankUserId() throws Exception {
+        mockMvc.perform(post("/rooms/direct")
+                        .with(jwt().jwt(builder -> builder.subject("user-1")))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"userId\":\"\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code").value("VALIDATION_ERROR"));
+    }
+
+    @Test
+    void createDirectRoomIsRejectedWithoutAToken() throws Exception {
+        mockMvc.perform(post("/rooms/direct")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"userId\":\"user-2\"}"))
+                .andExpect(status().isUnauthorized());
     }
 
     @Test

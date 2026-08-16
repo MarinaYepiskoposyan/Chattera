@@ -71,6 +71,26 @@ class RoomRepositoryTest {
     }
 
     @Test
+    void findByDirectKeyReturnsTheMatchingDirectRoom() {
+        Room directRoom = roomRepository.save(
+                new Room(UUID.randomUUID(), null, RoomType.DIRECT, "subA", Instant.now(), "subA:subB"));
+
+        assertThat(roomRepository.findByDirectKey("subA:subB")).contains(directRoom);
+        assertThat(roomRepository.findByDirectKey("subA:subC")).isEmpty();
+    }
+
+    @Test
+    void multipleRoomsWithNullDirectKeyAreAllowed() {
+        // Plain UNIQUE index on direct_key: PUBLIC/PRIVATE rooms all leave it
+        // null, and both Postgres and H2 permit multiple NULLs under a unique
+        // constraint - confirms that assumption against the real migration.
+        roomRepository.save(new Room(UUID.randomUUID(), "room-1", RoomType.PUBLIC, "owner", Instant.now()));
+        roomRepository.save(new Room(UUID.randomUUID(), "room-2", RoomType.PUBLIC, "owner", Instant.now()));
+
+        assertThat(roomRepository.findAll()).hasSize(2);
+    }
+
+    @Test
     void findByIdForUpdateLocksAndReturnsTheRoom() {
         Room room = roomRepository.save(new Room(UUID.randomUUID(), "locked-room", RoomType.PUBLIC, "owner", Instant.now()));
 

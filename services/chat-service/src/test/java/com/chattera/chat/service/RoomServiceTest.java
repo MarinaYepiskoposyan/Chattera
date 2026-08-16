@@ -23,6 +23,7 @@ import com.chattera.chat.repository.RoomRepository;
 import com.chattera.chat.service.exception.NotRoomMemberException;
 import com.chattera.chat.service.exception.RoomNotFoundException;
 import com.chattera.chat.service.exception.RoomNotSelfJoinableException;
+import com.chattera.chat.service.exception.SelfDmNotAllowedException;
 import com.chattera.chat.service.exception.UnsupportedRoomTypeException;
 import com.chattera.chat.web.dto.CreateRoomRequest;
 import com.chattera.domain.event.RoomMembershipRevokedEvent;
@@ -116,6 +117,16 @@ class RoomServiceTest {
         when(roomRepository.findById(roomId)).thenReturn(Optional.of(room));
 
         assertThatThrownBy(() -> roomService.joinRoom("user-2", roomId))
+                .isInstanceOf(RoomNotSelfJoinableException.class);
+    }
+
+    @Test
+    void joinRoomRejectsDirectRooms() {
+        UUID roomId = UUID.randomUUID();
+        Room room = new Room(roomId, null, RoomType.DIRECT, "subA", Instant.now(), "subA:subB");
+        when(roomRepository.findById(roomId)).thenReturn(Optional.of(room));
+
+        assertThatThrownBy(() -> roomService.joinRoom("user-3", roomId))
                 .isInstanceOf(RoomNotSelfJoinableException.class);
     }
 
@@ -247,6 +258,97 @@ class RoomServiceTest {
         assertThat(publicEntry.isMember()).isFalse();
         assertThat(memberEntry.isMember()).isTrue();
         assertThat(memberEntry.role()).isEqualTo(RoomRole.OWNER);
+    }
+
+    @Test
+    void findOrCreateDirectCreatesANewRoomWhenNoneExists() {
+        when(roomRepository.findByDirectKey("subA:subB")).thenReturn(Optional.empty());
+        Room created = new Room(UUID.randomUUID(), null, RoomType.DIRECT, "subA", Instant.now(), "subA:subB");
+        when(self.insertDirectRoom("subA", "subB", "subA:subB")).thenReturn(created);
+        RoomMember callerMembership = new RoomMember(created.getId(), "subA", RoomRole.MEMBER, Instant.now());
+        when(roomMemberRepository.findByRoomIdAndUserId(created.getId(), "subA"))
+                .thenReturn(Optional.of(callerMembership));
+
+        DirectRoomOutcome outcome = roomService.findOrCreateDirect("subA", "subB");
+
+        assertThat(outcome.created()).isTrue();
+        assertThat(outcome.roomWithMembership().room()).isEqualTo(created);
+        assertThat(outcome.roomWithMembership().role()).isEqualTo(RoomRole.MEMBER);
+        verify(self).insertDirectRoom("subA", "subB", "subA:subB");
+    }
+
+    @Test
+    void findOrCreateDirectComputesTheCanonicalSortedKeyRegardlessOfArgumentOrder() {
+        when(roomRepository.findByDirectKey("subA:subB")).thenReturn(Optional.empty());
+        Room created = new Room(UUID.randomUUID(), null, RoomType.DIRECT, "subB", Instant.now(), "subA:subB");
+        when(self.insertDirectRoom("subB", "subA", "subA:subB")).thenReturn(created);
+        when(roomMemberRepository.findByRoomIdAndUserId(created.getId(), "subB"))
+                .thenReturn(Optional.of(new RoomMember(created.getId(), "subB", RoomRole.MEMBER, Instant.now())));
+
+        DirectRoomOutcome outcome = roomService.findOrCreateDirect("subB", "subA");
+
+        assertThat(outcome.created()).isTrue();
+        verify(self).insertDirectRoom("subB", "subA", "subA:subB");
+    }
+
+    @Test
+    void findOrCreateDirectIsIdempotentForTheInitiator() {
+        UUID roomId = UUID.randomUUID();
+        Room existingRoom = new Room(roomId, null, RoomType.DIRECT, "subA", Instant.now(), "subA:subB");
+        when(roomRepository.findByDirectKey("subA:subB")).thenReturn(Optional.of(existingRoom));
+        when(roomMemberRepository.findByRoomIdAndUserId(roomId, "subA"))
+                .thenReturn(Optional.of(new RoomMember(roomId, "subA", RoomRole.MEMBER, Instant.now())));
+
+        DirectRoomOutcome outcome = roomService.findOrCreateDirect("subA", "subB");
+
+        assertThat(outcome.created()).isFalse();
+        assertThat(outcome.roomWithMembership().room().getId()).isEqualTo(roomId);
+        verify(self, never()).insertDirectRoom(any(), any(), any());
+    }
+
+    @Test
+    void findOrCreateDirectIsOrderIndependentForTheOtherParticipant() {
+        UUID roomId = UUID.randomUUID();
+        Room existingRoom = new Room(roomId, null, RoomType.DIRECT, "subA", Instant.now(), "subA:subB");
+        when(roomRepository.findByDirectKey("subA:subB")).thenReturn(Optional.of(existingRoom));
+        when(roomMemberRepository.findByRoomIdAndUserId(roomId, "subB"))
+                .thenReturn(Optional.of(new RoomMember(roomId, "subB", RoomRole.MEMBER, Instant.now())));
+
+        DirectRoomOutcome outcome = roomService.findOrCreateDirect("subB", "subA");
+
+        assertThat(outcome.created()).isFalse();
+        assertThat(outcome.roomWithMembership().room().getId()).isEqualTo(roomId);
+        verify(self, never()).insertDirectRoom(any(), any(), any());
+    }
+
+    @Test
+    void findOrCreateDirectRejectsSelfDm() {
+        assertThatThrownBy(() -> roomService.findOrCreateDirect("subA", "subA"))
+                .isInstanceOf(SelfDmNotAllowedException.class);
+        verify(roomRepository, never()).findByDirectKey(any());
+        verify(self, never()).insertDirectRoom(any(), any(), any());
+    }
+
+    @Test
+    void findOrCreateDirectLosingTheRaceReadsBackTheWinnersRowInsteadOfThrowing() {
+        // Mirrors joinRoom's race fix: this call's own findByDirectKey misses,
+        // its own insert then hits the other request's already-committed row
+        // and throws a duplicate-key violation on direct_key - the fix reads
+        // back the winner's row instead of surfacing that as a bare 500.
+        UUID roomId = UUID.randomUUID();
+        Room winnersRoom = new Room(roomId, null, RoomType.DIRECT, "subB", Instant.now(), "subA:subB");
+        when(roomRepository.findByDirectKey("subA:subB"))
+                .thenReturn(Optional.empty())
+                .thenReturn(Optional.of(winnersRoom));
+        when(self.insertDirectRoom("subA", "subB", "subA:subB"))
+                .thenThrow(new DataIntegrityViolationException("duplicate key value violates unique constraint"));
+        when(roomMemberRepository.findByRoomIdAndUserId(roomId, "subA"))
+                .thenReturn(Optional.of(new RoomMember(roomId, "subA", RoomRole.MEMBER, Instant.now())));
+
+        DirectRoomOutcome outcome = roomService.findOrCreateDirect("subA", "subB");
+
+        assertThat(outcome.created()).isFalse();
+        assertThat(outcome.roomWithMembership().room().getId()).isEqualTo(roomId);
     }
 
     private static RoomMember argThatOwnerMembership(String userId) {

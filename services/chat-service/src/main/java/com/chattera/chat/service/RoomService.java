@@ -23,6 +23,7 @@ import com.chattera.chat.repository.RoomRepository;
 import com.chattera.chat.service.exception.RoomNotFoundException;
 import com.chattera.chat.service.exception.NotRoomMemberException;
 import com.chattera.chat.service.exception.RoomNotSelfJoinableException;
+import com.chattera.chat.service.exception.SelfDmNotAllowedException;
 import com.chattera.chat.service.exception.UnsupportedRoomTypeException;
 import com.chattera.chat.web.dto.CreateRoomRequest;
 import com.chattera.domain.event.RoomMembershipRevokedEvent;
@@ -123,6 +124,68 @@ public class RoomService {
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     RoomMember insertMembership(UUID roomId, String userId, RoomRole role) {
         return roomMemberRepository.save(new RoomMember(roomId, userId, role, Instant.now()));
+    }
+
+    /**
+     * Find-or-create a DIRECT room for a user pair (CHAT-105). Looks up the
+     * canonical {@code direct_key}; if a room already exists for the pair it
+     * is returned as-is (find path, {@code created = false}), otherwise a
+     * new DIRECT room plus both membership rows are inserted atomically
+     * ({@code created = true}).
+     *
+     * <p>Same race shape and fix as {@link #joinRoom}: two concurrent
+     * find-or-create calls for the same pair can both pass the
+     * {@code findByDirectKey} lookup before either commits, so the loser's
+     * insert hits the {@code direct_key} unique index and throws
+     * {@link DataIntegrityViolationException}. Rather than propagate that,
+     * re-read the winner's row - through the {@code self} proxy in a fresh
+     * {@code REQUIRES_NEW} transaction, since a failed insert poisons the
+     * ambient transaction on real Postgres.
+     */
+    @Transactional
+    public DirectRoomOutcome findOrCreateDirect(String callerSub, String targetSub) {
+        if (callerSub.equals(targetSub)) {
+            throw new SelfDmNotAllowedException();
+        }
+        String directKey = canonicalDirectKey(callerSub, targetSub);
+        Optional<Room> existing = roomRepository.findByDirectKey(directKey);
+        if (existing.isPresent()) {
+            return new DirectRoomOutcome(withCallerRole(existing.get(), callerSub), false);
+        }
+        Room created;
+        try {
+            created = self.insertDirectRoom(callerSub, targetSub, directKey);
+        } catch (DataIntegrityViolationException duplicateDirectKey) {
+            // Two concurrent find-or-creates for the same pair both passed
+            // findByDirectKey above before either committed; the loser's
+            // insert hits the unique direct_key index and lands here. The
+            // winner's row is already committed and visible, so read it back
+            // instead of surfacing a bare 500 - same pattern as joinRoom.
+            Room winner = roomRepository.findByDirectKey(directKey)
+                    .orElseThrow(() -> duplicateDirectKey);
+            return new DirectRoomOutcome(withCallerRole(winner, callerSub), false);
+        }
+        return new DirectRoomOutcome(withCallerRole(created, callerSub), true);
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    Room insertDirectRoom(String callerSub, String targetSub, String directKey) {
+        Room room = new Room(UUID.randomUUID(), null, RoomType.DIRECT, callerSub, Instant.now(), directKey);
+        roomRepository.save(room);
+        roomMemberRepository.save(new RoomMember(room.getId(), callerSub, RoomRole.MEMBER, Instant.now()));
+        roomMemberRepository.save(new RoomMember(room.getId(), targetSub, RoomRole.MEMBER, Instant.now()));
+        return room;
+    }
+
+    private RoomWithMembership withCallerRole(Room room, String callerSub) {
+        RoomMember membership = roomMemberRepository.findByRoomIdAndUserId(room.getId(), callerSub)
+                .orElseThrow(() -> new NotRoomMemberException(room.getId()));
+        return new RoomWithMembership(room, membership.getRole());
+    }
+
+    /** Canonical sorted-pair key for a DIRECT room's {@code direct_key} column. */
+    private static String canonicalDirectKey(String subA, String subB) {
+        return subA.compareTo(subB) <= 0 ? subA + ":" + subB : subB + ":" + subA;
     }
 
     /**

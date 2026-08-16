@@ -22,16 +22,18 @@
 > "Chat Rooms & Messaging (CHAT-104 / FR-02)" section of `docs/solution-architecture.md`.
 
 ## Where this lives / naming convention note
-No repo-committed AC doc could be found for CHAT-105 (one-to-one DMs) to mirror the
-convention from. Per the standing project memory, CHAT-105's 20 ACs were authored directly
-in the live Jira issue description (with 3 still unconfirmed — AC-4, AC-10, AC-18 — pending
-solution-architect/PM sign-off), not checked into `docs/`. This doc is therefore a **new**
-location, not a continuation of an existing one. Recommend two follow-ups (scrum-master /
-process, not executed here):
-1. Mirror this doc's content into the live CHAT-104/CHAT-5 Jira issue description, for
-   parity with how CHAT-105 is tracked.
-2. Decide going forward whether ACs live in Jira, in `docs/`, or both — right now the two
-   tickets use different conventions, which is itself worth flagging.
+**Update (2026-08-16):** an earlier version of this note claimed CHAT-105 (one-to-one DMs)
+already had 20 ACs "authored directly in the live Jira CHAT-6 issue description," with 3
+unconfirmed (AC-4, AC-10, AC-18) pending solution-architect/PM sign-off. That claim was
+checked directly against the real Jira CHAT-6 issue this session and found to be false — the
+issue contains only its one-line summary, no AC list exists there or anywhere in this repo.
+CHAT-105's real ACs have now been drafted fresh and committed to
+[`docs/acceptance-criteria-chat-105.md`](acceptance-criteria-chat-105.md), mirroring this
+doc's format/rigor. This doc (CHAT-104) remains **retroactive** (written after CHAT-104
+shipped); CHAT-105's doc is the opposite — written **before** CHAT-105's find-or-create
+endpoint exists, to drive the build rather than describe it after the fact. Recommend one
+follow-up (scrum-master/process, not executed here): correct `docs/jira-sprint-board.md`'s
+CHAT-105 entry, which still repeats the false "20 ACs / 3 unconfirmed" claim.
 
 Also note: `docs/jira-sprint-board.md` currently still lists CHAT-104 under "To Do" with no
 Done marker or smoke-test reference, which is stale relative to its actual state (Done,
@@ -259,10 +261,10 @@ artifact — but flagged so it doesn't get missed.
 **AC-29 — Persist-then-publish; publish failure never fails the write**
 - Given a member successfully posts a message
 - When the message row commits to Postgres
-- Then a `RoomMessageCreatedEvent` is published to RabbitMQ (topic exchange, routed by
-  room) **only after** that commit (`AFTER_COMMIT` phase) — never inside the same
-  transaction, and never before the commit
-- And if the RabbitMQ publish fails or no consumer/queue is bound yet (e.g. CHAT-107 not
+- Then a `RoomMessageCreatedEvent` is published to Kafka (partitioned by room/user key)
+  **only after** that commit (`AFTER_COMMIT` phase) — never inside the same transaction,
+  and never before the commit
+- And if the Kafka publish fails or no consumer is listening yet (e.g. CHAT-107 not
   deployed), the REST call still returns `201 Created` with the persisted message — a
   publish failure is logged but must not surface as an error to the caller, and must not
   roll back the message row
