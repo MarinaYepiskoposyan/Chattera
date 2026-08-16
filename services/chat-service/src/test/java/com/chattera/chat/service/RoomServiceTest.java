@@ -8,8 +8,10 @@ import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 
 import com.chattera.chat.domain.Room;
@@ -23,6 +25,7 @@ import com.chattera.chat.service.exception.RoomNotFoundException;
 import com.chattera.chat.service.exception.RoomNotSelfJoinableException;
 import com.chattera.chat.service.exception.UnsupportedRoomTypeException;
 import com.chattera.chat.web.dto.CreateRoomRequest;
+import com.chattera.domain.event.RoomMembershipRevokedEvent;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -41,6 +44,9 @@ class RoomServiceTest {
     @Mock
     private RoomMemberRepository roomMemberRepository;
 
+    @Mock
+    private ApplicationEventPublisher applicationEventPublisher;
+
     /** Stands in for RoomService's self-proxy - see the class Javadoc on RoomService.self. */
     @Mock
     private RoomService self;
@@ -49,7 +55,7 @@ class RoomServiceTest {
 
     @BeforeEach
     void setUp() {
-        roomService = new RoomService(roomRepository, roomMemberRepository, self);
+        roomService = new RoomService(roomRepository, roomMemberRepository, applicationEventPublisher, self);
     }
 
     @Test
@@ -159,6 +165,23 @@ class RoomServiceTest {
     }
 
     @Test
+    void leaveRoomPublishesAMembershipRevokedEventForTheLeaver() {
+        UUID roomId = UUID.randomUUID();
+        Room room = new Room(roomId, "general", RoomType.PUBLIC, "owner", Instant.now());
+        RoomMember membership = new RoomMember(roomId, "user-2", RoomRole.MEMBER, Instant.now());
+        when(roomRepository.findByIdForUpdate(roomId)).thenReturn(Optional.of(room));
+        when(roomMemberRepository.findByRoomIdAndUserId(roomId, "user-2")).thenReturn(Optional.of(membership));
+
+        roomService.leaveRoom("user-2", roomId);
+
+        ArgumentCaptor<RoomMembershipRevokedEvent> eventCaptor = ArgumentCaptor.forClass(RoomMembershipRevokedEvent.class);
+        verify(applicationEventPublisher).publishEvent(eventCaptor.capture());
+        RoomMembershipRevokedEvent event = eventCaptor.getValue();
+        assertThat(event.roomId()).isEqualTo(roomId);
+        assertThat(event.userId()).isEqualTo("user-2");
+    }
+
+    @Test
     void leaveRoomOnUnknownMembershipThrows() {
         UUID roomId = UUID.randomUUID();
         Room room = new Room(roomId, "general", RoomType.PUBLIC, "owner", Instant.now());
@@ -167,6 +190,7 @@ class RoomServiceTest {
 
         assertThatThrownBy(() -> roomService.leaveRoom("not-a-member", roomId))
                 .isInstanceOf(NotRoomMemberException.class);
+        verify(applicationEventPublisher, never()).publishEvent(any());
     }
 
     @Test

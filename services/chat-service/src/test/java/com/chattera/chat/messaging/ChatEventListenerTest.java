@@ -6,6 +6,7 @@ import java.util.UUID;
 import org.junit.jupiter.api.Test;
 
 import com.chattera.domain.event.DomainEvent;
+import com.chattera.domain.event.RoomMembershipRevokedEvent;
 import com.chattera.domain.event.RoomMessageCreatedEvent;
 import com.chattera.domain.event.RoomMessageStatusChangedEvent;
 import com.chattera.messaging.EventPublisher;
@@ -39,6 +40,19 @@ class ChatEventListenerTest {
                 UUID.randomUUID(), roomId, "DELIVERED", "recipient", Instant.now());
 
         listener.onRoomMessageStatusChanged(event);
+
+        verify(eventPublisher).publish("room." + roomId, event);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void routesAMembershipRevokedEventToTheEventPublisherWithARoomScopedRoutingKey() {
+        EventPublisher<DomainEvent> eventPublisher = mock(EventPublisher.class);
+        ChatEventListener listener = new ChatEventListener(eventPublisher);
+        UUID roomId = UUID.randomUUID();
+        RoomMembershipRevokedEvent event = new RoomMembershipRevokedEvent(roomId, "user-2", Instant.now());
+
+        listener.onRoomMembershipRevoked(event);
 
         verify(eventPublisher).publish("room." + roomId, event);
     }

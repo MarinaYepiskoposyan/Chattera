@@ -5,17 +5,24 @@ import java.util.Set;
 
 import org.springframework.amqp.rabbit.annotation.RabbitHandler;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.messaging.MessageChannel;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.messaging.simp.stomp.StompCommand;
+import org.springframework.messaging.simp.stomp.StompHeaderAccessor;
 import org.springframework.messaging.simp.user.SimpSubscription;
 import org.springframework.messaging.simp.user.SimpUser;
 import org.springframework.messaging.simp.user.SimpUserRegistry;
+import org.springframework.messaging.support.MessageBuilder;
 import org.springframework.stereotype.Component;
 
 import com.chattera.domain.event.DomainEvent;
 import com.chattera.domain.event.MessageDeliveredEvent;
+import com.chattera.domain.event.RoomMembershipRevokedEvent;
 import com.chattera.domain.event.RoomMessageCreatedEvent;
 import com.chattera.domain.event.RoomMessageStatusChangedEvent;
 import com.chattera.messaging.EventPublisher;
+import com.chattera.wsgateway.membership.RoomMembershipChecker;
 
 /**
  * Consumes this pod's broadcast queue ({@code BroadcastQueueConfig}, bound
@@ -39,12 +46,20 @@ public class RoomEventBroadcastListener {
     private final SimpMessagingTemplate messagingTemplate;
     private final SimpUserRegistry simpUserRegistry;
     private final EventPublisher<DomainEvent> eventPublisher;
+    private final MessageChannel clientInboundChannel;
+    private final RoomMembershipChecker roomMembershipChecker;
 
     public RoomEventBroadcastListener(
-            SimpMessagingTemplate messagingTemplate, SimpUserRegistry simpUserRegistry, EventPublisher<DomainEvent> eventPublisher) {
+            SimpMessagingTemplate messagingTemplate,
+            SimpUserRegistry simpUserRegistry,
+            EventPublisher<DomainEvent> eventPublisher,
+            @Qualifier("clientInboundChannel") MessageChannel clientInboundChannel,
+            RoomMembershipChecker roomMembershipChecker) {
         this.messagingTemplate = messagingTemplate;
         this.simpUserRegistry = simpUserRegistry;
         this.eventPublisher = eventPublisher;
+        this.clientInboundChannel = clientInboundChannel;
+        this.roomMembershipChecker = roomMembershipChecker;
     }
 
     @RabbitHandler
@@ -57,6 +72,43 @@ public class RoomEventBroadcastListener {
     @RabbitHandler
     public void onRoomMessageStatusChanged(RoomMessageStatusChangedEvent event) {
         messagingTemplate.convertAndSend(TOPIC_ROOM_PREFIX + event.roomId(), event);
+    }
+
+    /**
+     * CHAT-37: unlike the handlers above, this must <b>not</b>
+     * {@code convertAndSend} the event to {@code /topic/rooms.{roomId}} -
+     * that would fan a revoke out to every subscriber, leaking who left. It
+     * instead targets only the revoked user's own subscription(s) to that
+     * room: force-unsubscribes each one via a synthetic STOMP
+     * {@code UNSUBSCRIBE} sent through the inbound channel (processed
+     * identically to a client-sent UNSUBSCRIBE by the simple broker, leaving
+     * the socket and the user's other subscriptions intact) and evicts the
+     * matching {@code RoomMembershipChecker} cache entry so a re-SUBSCRIBE
+     * within the TTL window re-hits chat-service instead of the stale
+     * positive cache. Pods that don't hold the user's socket find no
+     * matching subscription and no-op - the broadcast is safe to fan to all
+     * pods. See solution-architecture.md §4.
+     */
+    @RabbitHandler
+    public void onRoomMembershipRevoked(RoomMembershipRevokedEvent event) {
+        String destination = TOPIC_ROOM_PREFIX + event.roomId();
+        Set<SimpSubscription> subscriptions = simpUserRegistry.findSubscriptions(subscription ->
+                destination.equals(subscription.getDestination())
+                        && subscription.getSession() != null
+                        && subscription.getSession().getUser() != null
+                        && event.userId().equals(subscription.getSession().getUser().getName()));
+        for (SimpSubscription subscription : subscriptions) {
+            forceUnsubscribe(subscription);
+            roomMembershipChecker.evict(subscription.getSession().getId(), event.roomId());
+        }
+    }
+
+    private void forceUnsubscribe(SimpSubscription subscription) {
+        StompHeaderAccessor accessor = StompHeaderAccessor.create(StompCommand.UNSUBSCRIBE);
+        accessor.setSessionId(subscription.getSession().getId());
+        accessor.setSubscriptionId(subscription.getId());
+        accessor.setLeaveMutable(true);
+        clientInboundChannel.send(MessageBuilder.createMessage(new byte[0], accessor.getMessageHeaders()));
     }
 
     /**

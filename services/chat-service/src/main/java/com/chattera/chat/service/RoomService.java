@@ -7,6 +7,7 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Service;
@@ -24,6 +25,7 @@ import com.chattera.chat.service.exception.NotRoomMemberException;
 import com.chattera.chat.service.exception.RoomNotSelfJoinableException;
 import com.chattera.chat.service.exception.UnsupportedRoomTypeException;
 import com.chattera.chat.web.dto.CreateRoomRequest;
+import com.chattera.domain.event.RoomMembershipRevokedEvent;
 
 /**
  * Room creation, listing, join, and leave. See {@link RoomAccessService} for
@@ -35,6 +37,7 @@ public class RoomService {
 
     private final RoomRepository roomRepository;
     private final RoomMemberRepository roomMemberRepository;
+    private final ApplicationEventPublisher applicationEventPublisher;
 
     /**
      * Self-reference to this bean's own Spring proxy, used only to invoke
@@ -47,9 +50,14 @@ public class RoomService {
      */
     private final RoomService self;
 
-    public RoomService(RoomRepository roomRepository, RoomMemberRepository roomMemberRepository, @Lazy RoomService self) {
+    public RoomService(
+            RoomRepository roomRepository,
+            RoomMemberRepository roomMemberRepository,
+            ApplicationEventPublisher applicationEventPublisher,
+            @Lazy RoomService self) {
         this.roomRepository = roomRepository;
         this.roomMemberRepository = roomMemberRepository;
+        this.applicationEventPublisher = applicationEventPublisher;
         this.self = self;
     }
 
@@ -132,6 +140,14 @@ public class RoomService {
      * next-oldest member leaving at the same instant - are serialized rather
      * than both reading a stale "oldest remaining member" snapshot and
      * promoting/deleting inconsistently.
+     *
+     * <p>Publishes a {@link RoomMembershipRevokedEvent} Spring application
+     * event right after the membership row is deleted (CHAT-37). That event
+     * is picked up by {@code ChatEventListener} with
+     * {@code phase = AFTER_COMMIT} - same "persist-then-publish" pattern as
+     * {@code MessageService} - so a rolled-back leave never emits a phantom
+     * revoke. Only the leaver is revoked; the OWNER-leave auto-transfer below
+     * promotes a new owner but does not revoke their subscription.
      */
     @Transactional
     public void leaveRoom(String userId, UUID roomId) {
@@ -139,6 +155,7 @@ public class RoomService {
         RoomMember membership = roomMemberRepository.findByRoomIdAndUserId(room.getId(), userId)
                 .orElseThrow(() -> new NotRoomMemberException(roomId));
         roomMemberRepository.delete(membership);
+        applicationEventPublisher.publishEvent(new RoomMembershipRevokedEvent(roomId, userId, Instant.now()));
         if (membership.getRole() == RoomRole.OWNER) {
             roomMemberRepository.findFirstByRoomIdAndUserIdNotOrderByJoinedAtAsc(room.getId(), userId)
                     .ifPresent(nextOwner -> {

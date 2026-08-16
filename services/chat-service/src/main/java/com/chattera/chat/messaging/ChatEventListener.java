@@ -5,6 +5,7 @@ import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
 
 import com.chattera.domain.event.DomainEvent;
+import com.chattera.domain.event.RoomMembershipRevokedEvent;
 import com.chattera.domain.event.RoomMessageCreatedEvent;
 import com.chattera.domain.event.RoomMessageStatusChangedEvent;
 import com.chattera.messaging.EventPublisher;
@@ -43,6 +44,20 @@ public class ChatEventListener {
      */
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onRoomMessageStatusChanged(RoomMessageStatusChangedEvent event) {
+        eventPublisher.publish("room." + event.roomId(), event);
+    }
+
+    /**
+     * CHAT-37 membership-revocation write-back, published by
+     * {@code RoomService.leaveRoom} after the membership row is deleted. Same
+     * routing-key family as {@link #onRoomMessageCreated}
+     * ({@code room.<roomId>}) so it rides the same ws-gateway broadcast
+     * queue; ws-gateway force-drops the revoked user's live subscription to
+     * {@code /topic/rooms.{roomId}} without fanning the event out to anyone
+     * else.
+     */
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
+    public void onRoomMembershipRevoked(RoomMembershipRevokedEvent event) {
         eventPublisher.publish("room." + event.roomId(), event);
     }
 }

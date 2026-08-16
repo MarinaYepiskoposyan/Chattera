@@ -73,6 +73,20 @@ public class RoomMembershipChecker {
         positiveResultExpiryByCacheKey.keySet().removeIf(key -> key.startsWith(sessionId + ":"));
     }
 
+    /**
+     * Called when {@code RoomEventBroadcastListener} force-drops a live
+     * subscription on {@link com.chattera.domain.event.RoomMembershipRevokedEvent}
+     * (CHAT-37). Removes only the single {@code (sessionId, roomId)} cache
+     * entry, not the whole session ({@link #evictSession}) - the session's
+     * other room grants are still valid. Mandatory: without it, a
+     * just-revoked client that re-SUBSCRIBEs within the ~60s TTL would be
+     * re-admitted from the stale positive cache instead of re-hitting
+     * chat-service (which now correctly returns 404).
+     */
+    public void evict(String sessionId, UUID roomId) {
+        positiveResultExpiryByCacheKey.remove(cacheKey(sessionId, roomId));
+    }
+
     private static String cacheKey(String sessionId, UUID roomId) {
         return sessionId + ":" + roomId;
     }
